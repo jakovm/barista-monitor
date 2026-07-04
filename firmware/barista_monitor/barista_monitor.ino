@@ -244,6 +244,7 @@ void drawMainScreen() {
   uint16_t ink = inverted ? TFT_BLACK : TFT_WHITE;
 
   M5.Display.fillScreen(paper);
+  M5.Display.setTextFont(&fonts::AsciiFont8x16);
   M5.Display.setTextColor(ink, paper);
   M5.Display.setTextSize(1);
   M5.Display.setTextDatum(top_center);
@@ -293,26 +294,38 @@ void drawMainScreen() {
 }
 
 void drawSelectionScreen() {
+  static constexpr int ROW_X = 2;
+  static constexpr int ROW_W = 196;
+  static constexpr int ROW_H = 54;
+  static constexpr int ROW_Y[] = {34, 92, 150};
+
   M5.Display.fillScreen(TFT_WHITE);
-  M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
-  M5.Display.setTextSize(1);
-  M5.Display.setTextDatum(top_center);
-  M5.Display.drawString("Wer gereinigt?", 100, 10);
-  M5.Display.drawString("Drehen + EXT", 100, 26);
+  M5.Display.setTextFont(&fonts::AsciiFont8x16);
+  M5.Display.setTextDatum(middle_center);
 
   for (uint8_t i = 0; i < CLEANER_COUNT; i++) {
-    int y = 58 + i * 28;
+    int y = ROW_Y[i];
+    int cy = y + ROW_H / 2;
+
     if (i == picker) {
-      M5.Display.fillRect(16, y - 4, 168, 22, TFT_BLACK);
+      M5.Display.fillRect(ROW_X, y, ROW_W, ROW_H, TFT_BLACK);
       M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+      M5.Display.setTextSize(2);
     } else {
+      M5.Display.drawRect(ROW_X, y, ROW_W, ROW_H, TFT_BLACK);
       M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
+      M5.Display.setTextSize(1);
     }
-    M5.Display.drawString(CLEANERS[i], 100, y);
+
+    M5.Display.drawString(CLEANERS[i], 100, cy);
   }
 
+  M5.Display.setTextSize(1);
   M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
-  M5.Display.drawString("EXT = speichern", 100, 176);
+  M5.Display.setTextDatum(top_center);
+  M5.Display.drawString("Wer gereinigt?", 100, 4);
+  M5.Display.setTextDatum(bottom_center);
+  M5.Display.drawString("Drehen  |  EXT = OK", 100, 199);
 }
 
 void refreshDisplay() {
