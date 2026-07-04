@@ -4,6 +4,8 @@
 #include <esp_adc_cal.h>
 #include <esp_sleep.h>
 
+#include "emoji_bitmaps.h"
+
 static constexpr const char* NAMESPACE = "coffee";
 static constexpr const char* KEY_LAST_DATE = "lastYmd";
 static constexpr const char* KEY_CLEANER = "cleaner";
@@ -211,45 +213,47 @@ void drawBackground() {
   }
 }
 
-void drawSmileyArc(int cx, int cy, int radius, int mood) {
-  uint16_t ink = inkColor();
-  uint16_t paper = paperColor();
-
-  if (mood >= 3) {
-    M5.Display.drawCircle(cx, cy - 4, radius, ink);
-    M5.Display.drawCircle(cx, cy - 14, radius, paper);
-  } else if (mood == 2) {
-    M5.Display.drawCircle(cx, cy, radius, ink);
-    M5.Display.drawCircle(cx, cy - 10, radius, paper);
-  } else if (mood == 1) {
-    M5.Display.drawLine(cx - radius + 2, cy, cx + radius - 2, cy, ink);
-  } else {
-    M5.Display.drawCircle(cx, cy + 6, radius, ink);
-    M5.Display.drawCircle(cx, cy - 10, radius, paper);
+const char* emojiForMood(int mood) {
+  switch (mood) {
+    case 3:
+      return "\xF0\x9F\x98\x84";  // U+1F604 😄
+    case 2:
+      return "\xF0\x9F\x99\x82";  // U+1F642 🙂
+    case 1:
+      return "\xF0\x9F\x98\x90";  // U+1F610 😐
+    default:
+      return "\xF0\x9F\x98\xA0";  // U+1F620 😠
   }
 }
 
-void drawSmileyClassic(int cx, int cy, int mood) {
-  static constexpr int FACE_R = 44;
-  uint16_t ink = inkColor();
-  uint16_t paper = paperColor();
-
-  M5.Display.fillCircle(cx, cy, FACE_R, paper);
-  M5.Display.drawCircle(cx, cy, FACE_R, ink);
-  M5.Display.drawCircle(cx, cy, FACE_R - 1, ink);
-
-  int eyeY = cy - 12;
-  if (mood >= 2) {
-    M5.Display.fillCircle(cx - 15, eyeY, 5, ink);
-    M5.Display.fillCircle(cx + 15, eyeY, 5, ink);
-  } else {
-    M5.Display.drawLine(cx - 22, eyeY - 2, cx - 10, eyeY + 6, ink);
-    M5.Display.drawLine(cx - 10, eyeY + 6, cx - 22, eyeY + 6, ink);
-    M5.Display.drawLine(cx + 22, eyeY - 2, cx + 10, eyeY + 6, ink);
-    M5.Display.drawLine(cx + 10, eyeY + 6, cx + 22, eyeY + 6, ink);
+int32_t emojiDrawCallback(lgfx::LGFXBase* gfx, int32_t posX, int32_t posY, uint32_t code, int32_t font_height) {
+  const uint8_t* bitmap = emojiBitmapForCode(code);
+  if (bitmap == nullptr) {
+    return 0;
   }
 
-  drawSmileyArc(cx, cy + 14, 18, mood);
+  uint16_t fg = inkColor();
+  int32_t top = posY + (font_height - EMOJI_SIZE) / 2;
+
+  for (int row = 0; row < EMOJI_SIZE; row++) {
+    for (int col = 0; col < EMOJI_BYTES_PER_ROW; col++) {
+      uint8_t bits = pgm_read_byte(bitmap + (row * EMOJI_BYTES_PER_ROW) + col);
+      for (int bit = 0; bit < 8; bit++) {
+        if (bits & (1 << (7 - bit))) {
+          gfx->drawPixel(posX + col * 8 + bit, top + row, fg);
+        }
+      }
+    }
+  }
+  return EMOJI_SIZE;
+}
+
+void drawSmileyEmoji(int cx, int cy, int mood) {
+  M5.Display.setTextFont(&fonts::AsciiFont8x16);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextColor(inkColor(), paperColor());
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.drawString(emojiForMood(mood), cx, cy);
 }
 
 int smileyMood() {
@@ -325,7 +329,7 @@ void drawDayIndicatorLabel() {
 void drawMainScreen() {
   drawBackground();
 
-  drawSmileyClassic(100, 78, smileyMood());
+  drawSmileyEmoji(100, 78, smileyMood());
   drawDayIndicatorBar();
   drawDayIndicatorLabel();
   drawBatteryIndicator();
@@ -413,6 +417,8 @@ void setup() {
   updateBatteryEstimate();
 
   picker = 0;
+  M5.Display.setAttribute(lgfx::v1::utf8_switch, 1);
+  M5.Display.setEmojiCallback(emojiDrawCallback);
   refreshMainScreen();
 
   M5.Speaker.setVolume(0);
