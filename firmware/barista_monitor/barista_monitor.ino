@@ -234,13 +234,12 @@ void drawBoldCircle(int cx, int cy, int radius, uint16_t ink) {
   }
 }
 
-void drawIconArc(int cx, int cy, int radius, bool smile) {
+void drawMouthCurve(int cx, int cy, int halfWidth, int depth, bool smile) {
   uint16_t ink = inkColor();
-  uint16_t paper = paperColor();
-  int clipY = smile ? cy - (radius / 2) : cy + (radius / 2);
+  int controlY = smile ? cy + depth : cy - depth;
 
-  M5.Display.drawCircle(cx, cy, radius, ink);
-  M5.Display.drawCircle(cx, clipY, radius, paper);
+  M5.Display.drawBezier(cx - halfWidth, cy, cx, controlY, cx + halfWidth, cy, ink);
+  M5.Display.drawBezier(cx - halfWidth, cy + 1, cx, controlY + 1, cx + halfWidth, cy + 1, ink);
 }
 
 void drawMoodIconEyes(int cx, int cy, int size, int mood) {
@@ -279,20 +278,17 @@ void drawMoodIconEyes(int cx, int cy, int size, int mood) {
 void drawMoodIconMouth(int cx, int cy, int size, int mood) {
   int faceR = size / 2;
   int mouthY = cy + faceR / 4;
-  int mouthR = faceR / 3;
+  int mouthW = faceR / 2;
 
   if (mood >= 3) {
-    drawIconArc(cx, mouthY - mouthR / 4, mouthR, true);
+    drawMouthCurve(cx, mouthY, mouthW, faceR / 5, true);
   } else if (mood == 2) {
-    drawIconArc(cx, mouthY, mouthR - 2, true);
+    drawMouthCurve(cx, mouthY, mouthW - 4, faceR / 8, true);
   } else if (mood == 1) {
-    M5.Display.drawLine(cx - mouthR, mouthY, cx + mouthR, mouthY, inkColor());
-    M5.Display.drawLine(cx - mouthR, mouthY + 1, cx + mouthR, mouthY + 1, inkColor());
+    M5.Display.drawLine(cx - mouthW, mouthY, cx + mouthW, mouthY, inkColor());
+    M5.Display.drawLine(cx - mouthW, mouthY + 1, cx + mouthW, mouthY + 1, inkColor());
   } else {
-    drawIconArc(cx, mouthY + mouthR / 4, mouthR - 2, false);
-    int corner = mouthR / 2;
-    M5.Display.drawLine(cx - corner, mouthY + mouthR, cx - 4, mouthY + mouthR / 2, inkColor());
-    M5.Display.drawLine(cx + corner, mouthY + mouthR, cx + 4, mouthY + mouthR / 2, inkColor());
+    drawMouthCurve(cx, mouthY, mouthW - 4, faceR / 8, false);
   }
 }
 
