@@ -236,7 +236,7 @@ void drawBatteryIndicator() {
   M5.Display.setTextSize(1);
   M5.Display.setTextColor(ink, inverted ? TFT_WHITE : TFT_BLACK);
   M5.Display.setCursor(124, 176);
-  M5.Display.print("<10T");
+  M5.Display.print("<10d");
 }
 
 void drawMainScreen() {
@@ -249,40 +249,40 @@ void drawMainScreen() {
   M5.Display.setTextSize(1);
   M5.Display.setTextDatum(top_center);
 
-  M5.Display.drawString("Siebtraeger", 100, 6);
+  M5.Display.drawString("Espresso", 100, 6);
 
   char dateBuf[16];
   formatDate(lastCleanYmd, dateBuf, sizeof(dateBuf));
 
   M5.Display.setTextDatum(top_left);
   M5.Display.setCursor(8, 28);
-  M5.Display.print("Letzte Reinigung:");
+  M5.Display.print("Last cleaning:");
 
   M5.Display.setCursor(8, 44);
   if (daysSinceClean == 0) {
-    M5.Display.print("heute");
+    M5.Display.print("today");
   } else {
     M5.Display.print(dateBuf);
   }
 
   M5.Display.setCursor(8, 62);
-  M5.Display.printf("von %s", CLEANERS[lastCleaner]);
+  M5.Display.printf("by %s", CLEANERS[lastCleaner]);
 
   M5.Display.setCursor(8, 82);
   if (daysSinceClean == 0) {
-    M5.Display.print("frisch gereinigt");
+    M5.Display.print("freshly cleaned");
   } else if (daysSinceClean == 1) {
-    M5.Display.print("vor 1 Tag");
+    M5.Display.print("1 day ago");
   } else {
-    M5.Display.printf("vor %d Tagen", daysSinceClean);
+    M5.Display.printf("%d days ago", daysSinceClean);
   }
 
   if (daysSinceClean >= CLEAN_DAYS_OVERDUE) {
     M5.Display.setCursor(8, 102);
-    M5.Display.print("JETZT reinigen!");
+    M5.Display.print("CLEAN NOW!");
   } else if (daysSinceClean >= CLEAN_DAYS_WARN) {
     M5.Display.setCursor(8, 102);
-    M5.Display.print("bald reinigen");
+    M5.Display.print("clean soon");
   }
 
   drawSmiley(100, 132, smileyMood());
@@ -290,7 +290,7 @@ void drawMainScreen() {
 
   M5.Display.setTextDatum(top_center);
   M5.Display.setCursor(100, 186);
-  M5.Display.print("EXT: Reinigung");
+  M5.Display.print("EXT: log clean");
 }
 
 void drawSelectionScreen() {
@@ -323,9 +323,9 @@ void drawSelectionScreen() {
   M5.Display.setTextSize(1);
   M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
   M5.Display.setTextDatum(top_center);
-  M5.Display.drawString("Wer gereinigt?", 100, 4);
+  M5.Display.drawString("Who cleaned?", 100, 4);
   M5.Display.setTextDatum(bottom_center);
-  M5.Display.drawString("Drehen  |  EXT = OK", 100, 199);
+  M5.Display.drawString("Turn  |  EXT = OK", 100, 199);
 }
 
 void refreshDisplay() {
