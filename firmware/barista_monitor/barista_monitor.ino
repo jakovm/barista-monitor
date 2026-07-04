@@ -10,6 +10,8 @@ static constexpr const char* KEY_CLEANER = "cleaner";
 static constexpr const char* KEY_RTC_INIT = "rtcInit";
 static constexpr const char* KEY_BOOT_COUNT = "boots";
 static constexpr const char* KEY_VOLT_EMA = "voltEma";
+static constexpr const char* KEY_DIAG_VERSION = "diagVer";
+static constexpr uint8_t DIAG_VERSION = 1;
 
 static constexpr const char* CLEANERS[] = {"Jakov", "Nina", "Guest"};
 static constexpr uint8_t CLEANER_COUNT = 3;
@@ -158,6 +160,16 @@ float readBatteryVoltage() {
   esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 3600, &adcChars);
   uint32_t mv = esp_adc_cal_raw_to_voltage(analogRead(35), &adcChars);
   return (float)mv * 25.1f / 5.1f / 1000.0f;
+}
+
+void migrateDiagnostics() {
+  if (prefs.getUChar(KEY_DIAG_VERSION, 0) >= DIAG_VERSION) {
+    return;
+  }
+
+  prefs.remove(KEY_BOOT_COUNT);
+  prefs.remove(KEY_VOLT_EMA);
+  prefs.putUChar(KEY_DIAG_VERSION, DIAG_VERSION);
 }
 
 void updateBatteryEstimate() {
@@ -549,6 +561,7 @@ void setup() {
 
   prefs.begin(NAMESPACE, false);
   initRtcOnce();
+  migrateDiagnostics();
   loadState();
   updateBatteryEstimate();
 
