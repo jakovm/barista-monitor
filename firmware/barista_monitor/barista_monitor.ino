@@ -14,8 +14,8 @@ static constexpr const char* KEY_VOLT_EMA = "voltEma";
 static constexpr const char* CLEANERS[] = {"Jakov", "Nina", "Guest"};
 static constexpr uint8_t CLEANER_COUNT = 3;
 
-static constexpr uint8_t CLEAN_DAYS_WARN = 5;
-static constexpr uint8_t CLEAN_DAYS_OVERDUE = 7;
+static constexpr uint8_t CLEAN_DAYS_GRAY_START = 5;
+static constexpr uint8_t CLEAN_DAYS_INVERT = 7;
 static constexpr uint16_t AWAKE_MS = 120000;
 static constexpr float BAT_WARN_DAYS = 10.0f;
 static constexpr float BAT_FULL_V = 4.10f;
@@ -123,7 +123,7 @@ void loadState() {
     daysSinceClean = 0;
   }
 
-  inverted = daysSinceClean >= CLEAN_DAYS_OVERDUE;
+  inverted = daysSinceClean >= CLEAN_DAYS_INVERT;
 }
 
 void saveCleaning(uint8_t cleanerIndex) {
@@ -171,44 +171,84 @@ void updateBatteryEstimate() {
   batteryLow = estDays <= BAT_WARN_DAYS;
 }
 
-void drawSmiley(int cx, int cy, int mood) {
-  uint16_t ink = inverted ? TFT_BLACK : TFT_WHITE;
-  uint16_t paper = inverted ? TFT_WHITE : TFT_BLACK;
+uint16_t inkColor() {
+  return inverted ? TFT_WHITE : TFT_BLACK;
+}
 
-  int eyeY = cy - 10;
-  int mouthY = cy + 12;
+uint16_t paperColor() {
+  return inverted ? TFT_BLACK : TFT_WHITE;
+}
+
+int grayStage() {
+  if (daysSinceClean >= CLEAN_DAYS_INVERT) {
+    return -1;
+  }
+  if (daysSinceClean == 6) {
+    return 2;
+  }
+  if (daysSinceClean == 5) {
+    return 1;
+  }
+  return 0;
+}
+
+void drawBackground() {
+  if (inverted) {
+    M5.Display.fillScreen(TFT_BLACK);
+    return;
+  }
+
+  M5.Display.fillScreen(TFT_WHITE);
+  int stage = grayStage();
+  if (stage == 1) {
+    for (int y = 0; y < 200; y += 6) {
+      M5.Display.drawFastHLine(0, y, 200, TFT_BLACK);
+    }
+  } else if (stage == 2) {
+    for (int y = 0; y < 200; y += 3) {
+      M5.Display.drawFastHLine(0, y, 200, TFT_BLACK);
+    }
+  }
+}
+
+void drawSmiley(int cx, int cy, int mood) {
+  uint16_t ink = inkColor();
+  uint16_t paper = paperColor();
+
+  int eyeY = cy - 12;
+  int mouthY = cy + 14;
 
   if (mood >= 2) {
-    M5.Display.fillCircle(cx - 14, eyeY, 4, ink);
-    M5.Display.fillCircle(cx + 14, eyeY, 4, ink);
+    M5.Display.fillCircle(cx - 16, eyeY, 5, ink);
+    M5.Display.fillCircle(cx + 16, eyeY, 5, ink);
   } else {
-    M5.Display.drawLine(cx - 18, eyeY - 2, cx - 10, eyeY + 4, ink);
-    M5.Display.drawLine(cx - 10, eyeY + 4, cx - 18, eyeY + 4, ink);
-    M5.Display.drawLine(cx + 18, eyeY - 2, cx + 10, eyeY + 4, ink);
-    M5.Display.drawLine(cx + 10, eyeY + 4, cx + 18, eyeY + 4, ink);
+    M5.Display.drawLine(cx - 20, eyeY - 2, cx - 10, eyeY + 5, ink);
+    M5.Display.drawLine(cx - 10, eyeY + 5, cx - 20, eyeY + 5, ink);
+    M5.Display.drawLine(cx + 20, eyeY - 2, cx + 10, eyeY + 5, ink);
+    M5.Display.drawLine(cx + 10, eyeY + 5, cx + 20, eyeY + 5, ink);
   }
 
   if (mood >= 3) {
-    M5.Display.drawCircle(cx, mouthY, 16, ink);
-    M5.Display.drawCircle(cx, mouthY - 6, 16, paper);
+    M5.Display.drawCircle(cx, mouthY, 18, ink);
+    M5.Display.drawCircle(cx, mouthY - 7, 18, paper);
   } else if (mood == 2) {
-    M5.Display.drawCircle(cx, mouthY - 2, 12, ink);
-    M5.Display.drawCircle(cx, mouthY - 8, 12, paper);
+    M5.Display.drawCircle(cx, mouthY - 2, 14, ink);
+    M5.Display.drawCircle(cx, mouthY - 9, 14, paper);
   } else if (mood == 1) {
-    M5.Display.drawLine(cx - 14, mouthY, cx + 14, mouthY, ink);
+    M5.Display.drawLine(cx - 16, mouthY, cx + 16, mouthY, ink);
   } else {
-    M5.Display.drawCircle(cx, mouthY + 4, 12, ink);
-    M5.Display.drawCircle(cx, mouthY - 8, 12, paper);
-    M5.Display.drawLine(cx - 10, mouthY + 16, cx + 2, mouthY + 10, ink);
-    M5.Display.drawLine(cx + 10, mouthY + 16, cx - 2, mouthY + 10, ink);
+    M5.Display.drawCircle(cx, mouthY + 5, 14, ink);
+    M5.Display.drawCircle(cx, mouthY - 9, 14, paper);
+    M5.Display.drawLine(cx - 12, mouthY + 18, cx + 2, mouthY + 11, ink);
+    M5.Display.drawLine(cx + 12, mouthY + 18, cx - 2, mouthY + 11, ink);
   }
 }
 
 int smileyMood() {
-  if (daysSinceClean >= CLEAN_DAYS_OVERDUE) {
+  if (daysSinceClean >= CLEAN_DAYS_INVERT) {
     return 0;
   }
-  if (daysSinceClean >= CLEAN_DAYS_WARN) {
+  if (daysSinceClean >= CLEAN_DAYS_GRAY_START) {
     return 1;
   }
   if (daysSinceClean >= 3) {
@@ -217,9 +257,14 @@ int smileyMood() {
   return 3;
 }
 
-void formatDate(uint32_t ymdKey, char* out, size_t outLen) {
-  Ymd y = keyToYmd(ymdKey);
-  snprintf(out, outLen, "%02d.%02d.%04d", y.day, y.month, y.year);
+void formatDaysAgo(char* out, size_t outLen) {
+  if (daysSinceClean == 0) {
+    snprintf(out, outLen, "today");
+  } else if (daysSinceClean == 1) {
+    snprintf(out, outLen, "yesterday");
+  } else {
+    snprintf(out, outLen, "%d days ago", daysSinceClean);
+  }
 }
 
 void drawBatteryIndicator() {
@@ -227,105 +272,48 @@ void drawBatteryIndicator() {
     return;
   }
 
-  uint16_t ink = inverted ? TFT_BLACK : TFT_WHITE;
-  int x = 150;
-  int y = 182;
-  M5.Display.drawRect(x, y, 18, 9, ink);
-  M5.Display.fillRect(x + 18, y + 2, 3, 5, ink);
-  M5.Display.fillRect(x + 2, y + 2, 10, 5, ink);
-  M5.Display.setTextSize(1);
-  M5.Display.setTextColor(ink, inverted ? TFT_WHITE : TFT_BLACK);
-  M5.Display.setCursor(124, 176);
-  M5.Display.print("<10d");
+  uint16_t ink = inkColor();
+  M5.Display.drawRect(168, 4, 16, 8, ink);
+  M5.Display.fillRect(184, 6, 2, 4, ink);
+  M5.Display.fillRect(170, 6, 8, 4, ink);
 }
 
 void drawMainScreen() {
-  uint16_t paper = inverted ? TFT_WHITE : TFT_BLACK;
-  uint16_t ink = inverted ? TFT_BLACK : TFT_WHITE;
+  drawBackground();
 
-  M5.Display.fillScreen(paper);
+  drawSmiley(100, 88, smileyMood());
+
+  char daysText[20];
+  formatDaysAgo(daysText, sizeof(daysText));
+
   M5.Display.setTextFont(&fonts::AsciiFont8x16);
-  M5.Display.setTextColor(ink, paper);
+  M5.Display.setTextColor(inkColor(), paperColor());
   M5.Display.setTextSize(1);
-  M5.Display.setTextDatum(top_center);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.drawString(daysText, 100, 168);
 
-  M5.Display.drawString("Espresso", 100, 6);
-
-  char dateBuf[16];
-  formatDate(lastCleanYmd, dateBuf, sizeof(dateBuf));
-
-  M5.Display.setTextDatum(top_left);
-  M5.Display.setCursor(8, 28);
-  M5.Display.print("Last cleaning:");
-
-  M5.Display.setCursor(8, 44);
-  if (daysSinceClean == 0) {
-    M5.Display.print("today");
-  } else {
-    M5.Display.print(dateBuf);
-  }
-
-  M5.Display.setCursor(8, 62);
-  M5.Display.printf("by %s", CLEANERS[lastCleaner]);
-
-  M5.Display.setCursor(8, 82);
-  if (daysSinceClean == 0) {
-    M5.Display.print("freshly cleaned");
-  } else if (daysSinceClean == 1) {
-    M5.Display.print("1 day ago");
-  } else {
-    M5.Display.printf("%d days ago", daysSinceClean);
-  }
-
-  if (daysSinceClean >= CLEAN_DAYS_OVERDUE) {
-    M5.Display.setCursor(8, 102);
-    M5.Display.print("CLEAN NOW!");
-  } else if (daysSinceClean >= CLEAN_DAYS_WARN) {
-    M5.Display.setCursor(8, 102);
-    M5.Display.print("clean soon");
-  }
-
-  drawSmiley(100, 132, smileyMood());
   drawBatteryIndicator();
-
-  M5.Display.setTextDatum(top_center);
-  M5.Display.setCursor(100, 186);
-  M5.Display.print("EXT: log clean");
 }
 
 void drawSelectionScreen() {
-  static constexpr int ROW_X = 2;
-  static constexpr int ROW_W = 196;
-  static constexpr int ROW_H = 54;
-  static constexpr int ROW_Y[] = {34, 92, 150};
+  static constexpr int ROW_Y[] = {36, 100, 164};
 
   M5.Display.fillScreen(TFT_WHITE);
-  M5.Display.setTextFont(&fonts::AsciiFont8x16);
   M5.Display.setTextDatum(middle_center);
 
   for (uint8_t i = 0; i < CLEANER_COUNT; i++) {
-    int y = ROW_Y[i];
-    int cy = y + ROW_H / 2;
-
     if (i == picker) {
-      M5.Display.fillRect(ROW_X, y, ROW_W, ROW_H, TFT_BLACK);
+      M5.Display.fillRect(0, ROW_Y[i] - 28, 200, 56, TFT_BLACK);
+      M5.Display.setTextFont(&fonts::FreeSansBold18pt7b);
       M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-      M5.Display.setTextSize(2);
+      M5.Display.setTextSize(1);
     } else {
-      M5.Display.drawRect(ROW_X, y, ROW_W, ROW_H, TFT_BLACK);
+      M5.Display.setTextFont(&fonts::FreeSansBold12pt7b);
       M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
       M5.Display.setTextSize(1);
     }
-
-    M5.Display.drawString(CLEANERS[i], 100, cy);
+    M5.Display.drawString(CLEANERS[i], 100, ROW_Y[i]);
   }
-
-  M5.Display.setTextSize(1);
-  M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
-  M5.Display.setTextDatum(top_center);
-  M5.Display.drawString("Who cleaned?", 100, 4);
-  M5.Display.setTextDatum(bottom_center);
-  M5.Display.drawString("Turn  |  EXT = OK", 100, 199);
 }
 
 void refreshDisplay() {
@@ -336,6 +324,10 @@ void refreshDisplay() {
     drawMainScreen();
   }
   screenDirty = false;
+}
+
+bool dialClicked() {
+  return M5.BtnA.wasClicked() || M5.BtnB.wasClicked() || M5.BtnC.wasClicked();
 }
 
 uint32_t secondsUntilNextDailyWake() {
@@ -379,7 +371,7 @@ void setup() {
   loadState();
   updateBatteryEstimate();
 
-  picker = lastCleaner;
+  picker = 0;
   M5.Display.setEpdMode(epd_mode_t::epd_quality);
   refreshDisplay();
 
@@ -391,29 +383,27 @@ void loop() {
 
   M5.update();
 
-  if (M5.BtnEXT.wasClicked()) {
-    if (!selecting) {
-      selecting = true;
-      picker = lastCleaner;
-    } else {
-      saveCleaning(picker);
-      selecting = false;
-    }
+  bool enteredSelection = false;
+  if (!selecting && dialClicked()) {
+    selecting = true;
+    picker = 0;
     screenDirty = true;
+    enteredSelection = true;
   }
 
-  if (selecting) {
-    if (M5.BtnA.wasClicked() || M5.BtnC.wasClicked()) {
-      if (M5.BtnA.wasClicked()) {
-        picker = (picker + CLEANER_COUNT - 1) % CLEANER_COUNT;
-      } else {
-        picker = (picker + 1) % CLEANER_COUNT;
-      }
+  if (selecting && !enteredSelection) {
+    if (M5.BtnA.wasClicked()) {
+      picker = (picker + CLEANER_COUNT - 1) % CLEANER_COUNT;
+      screenDirty = true;
+    }
+    if (M5.BtnC.wasClicked()) {
+      picker = (picker + 1) % CLEANER_COUNT;
       screenDirty = true;
     }
     if (M5.BtnB.wasClicked()) {
       saveCleaning(picker);
       selecting = false;
+      awakeStart = millis();
       screenDirty = true;
     }
   }
