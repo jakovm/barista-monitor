@@ -21,7 +21,8 @@ static constexpr int SCREEN_H = 200;
 static constexpr int SCREEN_MARGIN = 4;
 static constexpr int DAY_BAND_H = 32;
 static constexpr int DAY_BAR_H = 10;
-static constexpr uint16_t AWAKE_MS = 30000;
+static constexpr uint16_t AWAKE_MS = 60000;
+static constexpr uint32_t IDLE_TIMER_SEC = 60;
 static constexpr float BAT_WARN_DAYS = 10.0f;
 static constexpr float BAT_FULL_V = 4.10f;
 static constexpr float BAT_EMPTY_V = 3.35f;
@@ -440,6 +441,20 @@ bool dialClicked() {
   return M5.BtnA.wasClicked() || M5.BtnB.wasClicked() || M5.BtnC.wasClicked();
 }
 
+bool userActive() {
+  return M5.BtnA.isPressed() || M5.BtnB.isPressed() || M5.BtnC.isPressed()
+      || M5.BtnPWR.isPressed() || M5.BtnEXT.isPressed();
+}
+
+void enableButtonWakeup() {
+  gpio_wakeup_enable(GPIO_NUM_37, GPIO_INTR_LOW_LEVEL);
+  gpio_wakeup_enable(GPIO_NUM_38, GPIO_INTR_LOW_LEVEL);
+  gpio_wakeup_enable(GPIO_NUM_39, GPIO_INTR_LOW_LEVEL);
+  gpio_wakeup_enable(GPIO_NUM_27, GPIO_INTR_LOW_LEVEL);
+  gpio_wakeup_enable(GPIO_NUM_5, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+}
+
 uint32_t secondsUntilNextDailyWake() {
   auto dt = M5.Rtc.getDateTime();
   int hour = dt.time.hours;
@@ -456,16 +471,36 @@ uint32_t secondsUntilNextDailyWake() {
   return (uint32_t)delta;
 }
 
-void enterSleep() {
-  M5.Display.setEpdMode(epd_mode_t::epd_fastest);
+void enterIdleSleep() {
+  M5.Display.sleep();
   M5.Power.setLed(0);
   WiFi.mode(WIFI_OFF);
 
-  uint32_t sleepSec = secondsUntilNextDailyWake();
-  if (sleepSec < 1800u) {
-    sleepSec = 1800u;
+  while (true) {
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    enableButtonWakeup();
+    esp_sleep_enable_timer_wakeup((uint64_t)IDLE_TIMER_SEC * 1000000ULL);
+
+    esp_light_sleep_start();
+
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    if (cause == ESP_SLEEP_WAKEUP_TIMER) {
+      loadState();
+      if (!selecting) {
+        M5.Display.wakeup();
+        refreshMainScreen(epd_mode_t::epd_fast);
+        M5.Display.sleep();
+      }
+      continue;
+    }
+
+    if (cause == ESP_SLEEP_WAKEUP_GPIO || cause == ESP_SLEEP_WAKEUP_EXT1 || cause == ESP_SLEEP_WAKEUP_EXT0) {
+      M5.Display.wakeup();
+      delay(30);
+      M5.update();
+      return;
+    }
   }
-  M5.Power.timerSleep((int)sleepSec);
 }
 
 void setup() {
@@ -491,6 +526,10 @@ void loop() {
   static uint32_t awakeStart = millis();
 
   M5.update();
+
+  if (userActive()) {
+    awakeStart = millis();
+  }
 
   bool enteredSelection = false;
   if (!selecting && dialClicked()) {
@@ -524,8 +563,12 @@ void loop() {
   }
 
   if (!selecting && (millis() - awakeStart) >= AWAKE_MS) {
-    enterSleep();
+    enterIdleSleep();
+    awakeStart = millis();
+    if (!selecting) {
+      refreshMainScreen(epd_mode_t::epd_fast);
+    }
   }
 
-  delay(selecting ? 1 : 50);
+  delay(selecting ? 1 : 20);
 }
