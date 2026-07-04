@@ -26,11 +26,14 @@ static constexpr int DAY_BAR_H = 14;
 static constexpr int BEAN_W = 22;
 static constexpr int BEAN_H = 12;
 static constexpr uint16_t AWAKE_MS = 60000;
-static constexpr uint32_t IDLE_TIMER_SEC = 60;
 static constexpr bool DEMO_DAY_PREVIEW = false;
 static constexpr uint8_t DEMO_DAY_COUNT = 10;
 static constexpr uint16_t DEMO_DAY_MS = 3000;
+static constexpr bool DEMO_BATTERY_PREVIEW = false;
+static constexpr uint8_t DEMO_BATTERY_START_DAYS = 14;
+static constexpr uint16_t DEMO_BATTERY_MS = 3000;
 static constexpr float BAT_WARN_DAYS = 10.0f;
+static constexpr uint8_t BAT_ALARM_DAYS = 7;
 static constexpr float BAT_FULL_V = 4.10f;
 static constexpr float BAT_EMPTY_V = 3.35f;
 
@@ -43,6 +46,10 @@ uint32_t lastCleanYmd = 0;
 uint8_t lastCleaner = 0;
 bool inverted = false;
 bool batteryLow = false;
+float batteryEstDays = 90.0f;
+bool batteryDemoActive = false;
+int lastRenderedDaysSinceClean = -1;
+bool lastRenderedBatteryLow = false;
 
 struct Ymd {
   int year;
@@ -190,8 +197,8 @@ void updateBatteryEstimate() {
     remainingFrac = 1.0f;
   }
 
-  float estDays = remainingFrac * 90.0f;
-  batteryLow = estDays <= BAT_WARN_DAYS;
+  batteryEstDays = remainingFrac * 90.0f;
+  batteryLow = batteryEstDays <= BAT_WARN_DAYS;
 }
 
 uint16_t inkColor() {
@@ -234,14 +241,23 @@ void drawBackground() {
   }
 }
 
+bool batteryIndicatorVisible() {
+  return batteryLow || batteryDemoActive;
+}
+
+bool batteryAlarmMode() {
+  return batteryIndicatorVisible() && batteryEstDays <= (float)BAT_ALARM_DAYS;
+}
+
 void moodIconLayout(int* cx, int* cy, int* size) {
   int maxW = SCREEN_W - (SCREEN_MARGIN * 2);
   int bottomUi = DAY_BAR_H + 4 + DAY_BAND_H + SCREEN_MARGIN;
-  int maxH = SCREEN_H - SCREEN_MARGIN - bottomUi;
-  int areaH = SCREEN_H - SCREEN_MARGIN - bottomUi;
-  *size = (maxW < maxH) ? maxW : maxH;
+  int topReserve = batteryAlarmMode() ? 46 : 0;
+  int maxH = SCREEN_H - SCREEN_MARGIN - bottomUi - topReserve;
+  int areaH = maxH;
+  *size = (maxW < areaH) ? maxW : areaH;
   *cx = SCREEN_W / 2;
-  *cy = SCREEN_MARGIN + (areaH / 2);
+  *cy = SCREEN_MARGIN + topReserve + (areaH / 2);
 }
 
 void drawBoldCircle(int cx, int cy, int radius, uint16_t ink) {
@@ -358,15 +374,87 @@ void formatDaysAgo(char* out, size_t outLen) {
   }
 }
 
+void drawThickRect(int x, int y, int w, int h, uint16_t ink, int thickness) {
+  for (int t = 0; t < thickness; t++) {
+    M5.Display.drawRect(x + t, y + t, w - (t * 2), h - (t * 2), ink);
+  }
+}
+
+void drawBatteryGlyph(int x, int y, int bodyW, int bodyH, int tipW, int tipH, int innerX, int innerY,
+                      int innerW, int innerH, int fillW, uint16_t ink, int stroke) {
+  drawThickRect(x, y, bodyW, bodyH, ink, stroke);
+  int tipY = y + (bodyH - tipH) / 2;
+  drawThickRect(x + bodyW, tipY, tipW, tipH, ink, stroke);
+
+  if (fillW > innerW) {
+    fillW = innerW;
+  }
+  if (fillW > 0) {
+    M5.Display.fillRect(innerX, innerY, fillW, innerH, ink);
+  }
+}
+
+void drawAlarmMarks(int x, int y, int w, int h, uint16_t ink) {
+  for (int i = -h; i < w; i += 6) {
+    M5.Display.drawLine(x + i, y, x + i + h, y + h, ink);
+    M5.Display.drawLine(x + i + 1, y, x + i + h + 1, y + h, ink);
+  }
+}
+
+void drawSmallBatteryIndicator(uint16_t ink) {
+  float scaleDays = batteryDemoActive ? (float)DEMO_BATTERY_START_DAYS : BAT_WARN_DAYS;
+  int fillW = (int)(8.0f * batteryEstDays / scaleDays + 0.5f);
+  if (fillW > 8) {
+    fillW = 8;
+  }
+  if (fillW < 0) {
+    fillW = 0;
+  }
+
+  drawBatteryGlyph(168, 4, 16, 8, 2, 4, 170, 6, 8, 4, fillW, ink, 1);
+}
+
+void drawAlarmBatteryIndicator(uint16_t ink) {
+  static constexpr int BODY_W = 78;
+  static constexpr int BODY_H = 34;
+  static constexpr int TIP_W = 10;
+  static constexpr int TIP_H = 18;
+  static constexpr int INNER_PAD = 6;
+  static constexpr int X = (SCREEN_W - BODY_W - TIP_W) / 2;
+  static constexpr int Y = 6;
+  static constexpr int INNER_W = BODY_W - (INNER_PAD * 2);
+  static constexpr int INNER_H = BODY_H - (INNER_PAD * 2);
+
+  int fillW = (int)(INNER_W * batteryEstDays / (float)BAT_ALARM_DAYS + 0.5f);
+  if (fillW < 0) {
+    fillW = 0;
+  }
+
+  drawBatteryGlyph(X, Y, BODY_W, BODY_H, TIP_W, TIP_H, X + INNER_PAD, Y + INNER_PAD,
+                   INNER_W, INNER_H, fillW, ink, 3);
+
+  if (batteryEstDays <= 3.0f) {
+    drawAlarmMarks(X + INNER_PAD, Y + INNER_PAD, INNER_W, INNER_H, ink);
+  }
+
+  M5.Display.setTextFont(&fonts::AsciiFont8x16);
+  M5.Display.setTextColor(ink, paperColor());
+  M5.Display.setTextSize(3);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.drawString("!", SCREEN_W / 2, Y + BODY_H + 14);
+}
+
 void drawBatteryIndicator() {
-  if (!batteryLow) {
+  if (!batteryIndicatorVisible()) {
     return;
   }
 
   uint16_t ink = inkColor();
-  M5.Display.drawRect(168, 4, 16, 8, ink);
-  M5.Display.fillRect(184, 6, 2, 4, ink);
-  M5.Display.fillRect(170, 6, 8, 4, ink);
+  if (batteryAlarmMode()) {
+    drawAlarmBatteryIndicator(ink);
+  } else {
+    drawSmallBatteryIndicator(ink);
+  }
 }
 
 void drawCoffeeBean(int cx, int cy, bool filled) {
@@ -424,8 +512,17 @@ void drawMainScreen() {
   drawBatteryIndicator();
 }
 
-static constexpr int SELECTION_ROW_Y[] = {36, 100, 164};
-static constexpr int SELECTION_ROW_H = 56;
+static constexpr uint8_t SELECTION_ITEM_COUNT = CLEANER_COUNT + 1;
+static constexpr uint8_t SELECTION_BACK_INDEX = CLEANER_COUNT;
+static constexpr int SELECTION_ROW_Y[] = {25, 75, 125, 175};
+static constexpr int SELECTION_ROW_H = 48;
+
+const char* selectionLabel(uint8_t index) {
+  if (index < CLEANER_COUNT) {
+    return CLEANERS[index];
+  }
+  return "back";
+}
 
 void drawSelectionRow(uint8_t index, bool selected) {
   int bandY = SELECTION_ROW_Y[index] - SELECTION_ROW_H / 2;
@@ -433,13 +530,22 @@ void drawSelectionRow(uint8_t index, bool selected) {
   M5.Display.fillRect(0, bandY, 200, SELECTION_ROW_H, selected ? TFT_BLACK : TFT_WHITE);
   M5.Display.setTextFont(&fonts::AsciiFont8x16);
   M5.Display.setTextColor(selected ? TFT_WHITE : TFT_BLACK, selected ? TFT_BLACK : TFT_WHITE);
-  M5.Display.setTextSize(selected ? 2 : 1);
+  M5.Display.setTextSize(2);
   M5.Display.setTextDatum(middle_center);
-  M5.Display.drawString(CLEANERS[index], 100, SELECTION_ROW_Y[index]);
+  M5.Display.drawString(selectionLabel(index), 100, SELECTION_ROW_Y[index]);
 }
 
 void commitDisplay() {
   M5.Display.endWrite();
+}
+
+void syncRenderedState() {
+  lastRenderedDaysSinceClean = daysSinceClean;
+  lastRenderedBatteryLow = batteryLow;
+}
+
+bool displayNeedsRefresh() {
+  return daysSinceClean != lastRenderedDaysSinceClean || batteryLow != lastRenderedBatteryLow;
 }
 
 void refreshMainScreen(epd_mode_t mode) {
@@ -448,6 +554,7 @@ void refreshMainScreen(epd_mode_t mode) {
   drawMainScreen();
   commitDisplay();
   screenDirty = false;
+  syncRenderedState();
 }
 
 bool wokeFromDailyTimer() {
@@ -467,11 +574,26 @@ void runDayPreviewDemo() {
   }
 }
 
+void runBatteryPreviewDemo() {
+  batteryDemoActive = true;
+  daysSinceClean = 0;
+  inverted = false;
+
+  for (int day = DEMO_BATTERY_START_DAYS; day >= 0; day--) {
+    batteryEstDays = (float)day;
+    batteryLow = day <= (int)BAT_WARN_DAYS;
+    refreshMainScreen(epd_mode_t::epd_fast);
+    delay(DEMO_BATTERY_MS);
+  }
+
+  batteryDemoActive = false;
+}
+
 void enterSelectionScreen() {
   M5.Display.setEpdMode(epd_mode_t::epd_fastest);
   M5.Display.startWrite();
   M5.Display.fillScreen(TFT_WHITE);
-  for (uint8_t i = 0; i < CLEANER_COUNT; i++) {
+  for (uint8_t i = 0; i < SELECTION_ITEM_COUNT; i++) {
     drawSelectionRow(i, i == picker);
   }
   commitDisplay();
@@ -505,15 +627,10 @@ void enableButtonWakeup() {
 
 uint32_t secondsUntilNextDailyWake() {
   auto dt = M5.Rtc.getDateTime();
-  int hour = dt.time.hours;
-  int minute = dt.time.minutes;
-  int second = dt.time.seconds;
-
-  int targetHour = 7;
-  int secondsNow = hour * 3600 + minute * 60 + second;
-  int secondsTarget = targetHour * 3600;
+  int secondsNow = dt.time.hours * 3600 + dt.time.minutes * 60 + dt.time.seconds;
+  int secondsTarget = 7 * 3600;
   int delta = secondsTarget - secondsNow;
-  if (delta <= 300) {
+  if (delta <= 0) {
     delta += 86400;
   }
   return (uint32_t)delta;
@@ -527,14 +644,15 @@ void enterIdleSleep() {
   while (true) {
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
     enableButtonWakeup();
-    esp_sleep_enable_timer_wakeup((uint64_t)IDLE_TIMER_SEC * 1000000ULL);
+    esp_sleep_enable_timer_wakeup((uint64_t)secondsUntilNextDailyWake() * 1000000ULL);
 
     esp_light_sleep_start();
 
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     if (cause == ESP_SLEEP_WAKEUP_TIMER) {
       loadState();
-      if (!selecting) {
+      updateBatteryEstimate();
+      if (!selecting && displayNeedsRefresh()) {
         M5.Display.wakeup();
         refreshMainScreen(epd_mode_t::epd_fast);
         M5.Display.sleep();
@@ -572,6 +690,11 @@ void setup() {
     loadState();
   }
 
+  if (DEMO_BATTERY_PREVIEW) {
+    runBatteryPreviewDemo();
+    updateBatteryEstimate();
+  }
+
   refreshMainScreen(wokeFromDailyTimer() ? epd_mode_t::epd_quality : epd_mode_t::epd_fast);
 
   M5.Speaker.setVolume(0);
@@ -597,19 +720,23 @@ void loop() {
   if (selecting && !enteredSelection) {
     if (M5.BtnA.wasClicked()) {
       uint8_t previousPicker = picker;
-      picker = (picker + CLEANER_COUNT - 1) % CLEANER_COUNT;
+      picker = (picker + SELECTION_ITEM_COUNT - 1) % SELECTION_ITEM_COUNT;
       updateSelectionPicker(previousPicker);
     }
     if (M5.BtnC.wasClicked()) {
       uint8_t previousPicker = picker;
-      picker = (picker + 1) % CLEANER_COUNT;
+      picker = (picker + 1) % SELECTION_ITEM_COUNT;
       updateSelectionPicker(previousPicker);
     }
     if (M5.BtnB.wasClicked()) {
-      saveCleaning(picker);
       selecting = false;
       awakeStart = millis();
-      refreshMainScreen(epd_mode_t::epd_fastest);
+      if (picker == SELECTION_BACK_INDEX) {
+        refreshMainScreen(epd_mode_t::epd_fastest);
+      } else {
+        saveCleaning(picker);
+        refreshMainScreen(epd_mode_t::epd_fastest);
+      }
     }
   }
 
@@ -620,9 +747,6 @@ void loop() {
   if (!selecting && (millis() - awakeStart) >= AWAKE_MS) {
     enterIdleSleep();
     awakeStart = millis();
-    if (!selecting) {
-      refreshMainScreen(epd_mode_t::epd_fast);
-    }
   }
 
   delay(selecting ? 1 : 20);
