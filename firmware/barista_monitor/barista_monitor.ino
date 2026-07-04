@@ -331,35 +331,40 @@ void drawMainScreen() {
   drawBatteryIndicator();
 }
 
-void drawSelectionScreen() {
-  static constexpr int ROW_Y[] = {36, 100, 164};
+static constexpr int SELECTION_ROW_Y[] = {36, 100, 164};
+static constexpr int SELECTION_ROW_H = 56;
 
-  M5.Display.fillScreen(TFT_WHITE);
+void drawSelectionRow(uint8_t index, bool selected) {
+  int bandY = SELECTION_ROW_Y[index] - SELECTION_ROW_H / 2;
+
+  M5.Display.fillRect(0, bandY, 200, SELECTION_ROW_H, selected ? TFT_BLACK : TFT_WHITE);
+  M5.Display.setTextFont(&fonts::AsciiFont8x16);
+  M5.Display.setTextColor(selected ? TFT_WHITE : TFT_BLACK, selected ? TFT_BLACK : TFT_WHITE);
+  M5.Display.setTextSize(selected ? 2 : 1);
   M5.Display.setTextDatum(middle_center);
+  M5.Display.drawString(CLEANERS[index], 100, SELECTION_ROW_Y[index]);
+}
 
+void refreshMainScreen() {
+  M5.Display.setEpdMode(epd_mode_t::epd_quality);
+  drawMainScreen();
+  screenDirty = false;
+}
+
+void enterSelectionScreen() {
+  M5.Display.setEpdMode(epd_mode_t::epd_fastest);
+  M5.Display.fillScreen(TFT_WHITE);
   for (uint8_t i = 0; i < CLEANER_COUNT; i++) {
-    if (i == picker) {
-      M5.Display.fillRect(0, ROW_Y[i] - 28, 200, 56, TFT_BLACK);
-      M5.Display.setTextFont(&fonts::FreeSansBold18pt7b);
-      M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-      M5.Display.setTextSize(1);
-    } else {
-      M5.Display.setTextFont(&fonts::FreeSansBold12pt7b);
-      M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
-      M5.Display.setTextSize(1);
-    }
-    M5.Display.drawString(CLEANERS[i], 100, ROW_Y[i]);
+    drawSelectionRow(i, i == picker);
   }
 }
 
-void refreshDisplay() {
-  M5.Display.setEpdMode(epd_mode_t::epd_quality);
-  if (selecting) {
-    drawSelectionScreen();
-  } else {
-    drawMainScreen();
-  }
-  screenDirty = false;
+void updateSelectionPicker(uint8_t previousPicker) {
+  M5.Display.setEpdMode(epd_mode_t::epd_fastest);
+  M5.Display.startWrite();
+  drawSelectionRow(previousPicker, false);
+  drawSelectionRow(picker, true);
+  M5.Display.endWrite();
 }
 
 bool dialClicked() {
@@ -408,8 +413,7 @@ void setup() {
   updateBatteryEstimate();
 
   picker = 0;
-  M5.Display.setEpdMode(epd_mode_t::epd_quality);
-  refreshDisplay();
+  refreshMainScreen();
 
   M5.Speaker.setVolume(0);
 }
@@ -423,34 +427,36 @@ void loop() {
   if (!selecting && dialClicked()) {
     selecting = true;
     picker = 0;
-    screenDirty = true;
     enteredSelection = true;
+    enterSelectionScreen();
   }
 
   if (selecting && !enteredSelection) {
     if (M5.BtnA.wasClicked()) {
+      uint8_t previousPicker = picker;
       picker = (picker + CLEANER_COUNT - 1) % CLEANER_COUNT;
-      screenDirty = true;
+      updateSelectionPicker(previousPicker);
     }
     if (M5.BtnC.wasClicked()) {
+      uint8_t previousPicker = picker;
       picker = (picker + 1) % CLEANER_COUNT;
-      screenDirty = true;
+      updateSelectionPicker(previousPicker);
     }
     if (M5.BtnB.wasClicked()) {
       saveCleaning(picker);
       selecting = false;
       awakeStart = millis();
-      screenDirty = true;
+      refreshMainScreen();
     }
   }
 
-  if (screenDirty) {
-    refreshDisplay();
+  if (!selecting && screenDirty) {
+    refreshMainScreen();
   }
 
   if (!selecting && (millis() - awakeStart) >= AWAKE_MS) {
     enterSleep();
   }
 
-  delay(20);
+  delay(selecting ? 1 : 20);
 }
