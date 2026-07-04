@@ -216,57 +216,38 @@ void drawBackground() {
   }
 }
 
-int smileyLayoutSize() {
+void moodIconLayout(int* cx, int* cy, int* size) {
   int maxW = SCREEN_W - (SCREEN_MARGIN * 2);
   int bottomUi = DAY_BAR_H + 4 + DAY_BAND_H + SCREEN_MARGIN;
   int maxH = SCREEN_H - SCREEN_MARGIN - bottomUi;
-  return (maxW < maxH) ? maxW : maxH;
-}
-
-void smileyLayoutCenter(int* cx, int* cy) {
-  int bottomUi = DAY_BAR_H + 4 + DAY_BAND_H + SCREEN_MARGIN;
   int areaH = SCREEN_H - SCREEN_MARGIN - bottomUi;
+  *size = (maxW < maxH) ? maxW : maxH;
   *cx = SCREEN_W / 2;
   *cy = SCREEN_MARGIN + (areaH / 2);
 }
 
-void drawSmileyMouth(int cx, int cy, int size, int mood) {
-  uint16_t ink = inkColor();
-  uint16_t paper = paperColor();
-  int radius = (size * 22) / 100;
-
-  if (mood >= 3) {
-    M5.Display.drawCircle(cx, cy + radius / 4, radius, ink);
-    M5.Display.drawCircle(cx, cy - radius / 2, radius, paper);
-  } else if (mood == 2) {
-    M5.Display.drawCircle(cx, cy + radius / 8, radius - 2, ink);
-    M5.Display.drawCircle(cx, cy - radius / 2, radius - 2, paper);
-  } else if (mood == 1) {
-    M5.Display.drawLine(cx - radius, cy + radius / 3, cx + radius, cy + radius / 3, ink);
-  } else {
-    M5.Display.drawCircle(cx, cy + radius / 2, radius - 2, ink);
-    M5.Display.drawCircle(cx, cy - radius / 2, radius - 2, paper);
-    M5.Display.drawLine(cx - radius + 4, cy + radius, cx - 4, cy + radius / 3, ink);
-    M5.Display.drawLine(cx + radius - 4, cy + radius, cx + 4, cy + radius / 3, ink);
+void drawBoldCircle(int cx, int cy, int radius, uint16_t ink) {
+  M5.Display.drawCircle(cx, cy, radius, ink);
+  if (radius > 2) {
+    M5.Display.drawCircle(cx, cy, radius - 1, ink);
   }
 }
 
-void drawSmileyFace(int mood) {
-  int cx = 0;
-  int cy = 0;
-  int size = smileyLayoutSize();
-  smileyLayoutCenter(&cx, &cy);
-
+void drawIconArc(int cx, int cy, int radius, bool smile) {
   uint16_t ink = inkColor();
   uint16_t paper = paperColor();
+  int clipY = smile ? cy - (radius / 2) : cy + (radius / 2);
+
+  M5.Display.drawCircle(cx, cy, radius, ink);
+  M5.Display.drawCircle(cx, clipY, radius, paper);
+}
+
+void drawMoodIconEyes(int cx, int cy, int size, int mood) {
+  uint16_t ink = inkColor();
   int faceR = size / 2;
-
-  M5.Display.fillCircle(cx, cy, faceR, paper);
-  M5.Display.drawCircle(cx, cy, faceR, ink);
-
-  int eyeY = cy - faceR / 4;
-  int eyeX = faceR / 3;
-  int eyeR = faceR / 9;
+  int eyeY = cy - faceR / 5;
+  int eyeX = (faceR * 2) / 5;
+  int eyeR = faceR / 8;
   if (eyeR < 4) {
     eyeR = 4;
   }
@@ -274,20 +255,60 @@ void drawSmileyFace(int mood) {
   if (mood >= 2) {
     M5.Display.fillCircle(cx - eyeX, eyeY, eyeR, ink);
     M5.Display.fillCircle(cx + eyeX, eyeY, eyeR, ink);
-  } else if (mood == 1) {
-    int w = eyeR * 2;
-    M5.Display.fillRect(cx - eyeX - w / 2, eyeY - 1, w, 3, ink);
-    M5.Display.fillRect(cx + eyeX - w / 2, eyeY - 1, w, 3, ink);
-  } else {
-    int browLen = faceR / 3;
-    int browDrop = faceR / 10;
-    M5.Display.drawLine(cx - eyeX - browLen, eyeY - browDrop, cx - eyeX + browLen / 2, eyeY + browDrop, ink);
-    M5.Display.drawLine(cx + eyeX + browLen, eyeY - browDrop, cx + eyeX - browLen / 2, eyeY + browDrop, ink);
-    M5.Display.fillCircle(cx - eyeX, eyeY + browDrop, eyeR - 1, ink);
-    M5.Display.fillCircle(cx + eyeX, eyeY + browDrop, eyeR - 1, ink);
+    return;
   }
 
-  drawSmileyMouth(cx, cy + faceR / 6, size, mood);
+  if (mood == 1) {
+    int w = eyeR * 2 + 2;
+    M5.Display.fillRect(cx - eyeX - w / 2, eyeY - 1, w, 3, ink);
+    M5.Display.fillRect(cx + eyeX - w / 2, eyeY - 1, w, 3, ink);
+    return;
+  }
+
+  int browLen = faceR / 3;
+  int browDrop = faceR / 9;
+  M5.Display.drawLine(cx - eyeX - browLen, eyeY - browDrop, cx - eyeX + browLen / 2, eyeY + browDrop, ink);
+  M5.Display.drawLine(cx - eyeX - browLen, eyeY - browDrop + 1, cx - eyeX + browLen / 2, eyeY + browDrop + 1, ink);
+  M5.Display.drawLine(cx + eyeX + browLen, eyeY - browDrop, cx + eyeX - browLen / 2, eyeY + browDrop, ink);
+  M5.Display.drawLine(cx + eyeX + browLen, eyeY - browDrop + 1, cx + eyeX - browLen / 2, eyeY + browDrop + 1, ink);
+  M5.Display.fillCircle(cx - eyeX, eyeY + browDrop, eyeR - 1, ink);
+  M5.Display.fillCircle(cx + eyeX, eyeY + browDrop, eyeR - 1, ink);
+}
+
+void drawMoodIconMouth(int cx, int cy, int size, int mood) {
+  int faceR = size / 2;
+  int mouthY = cy + faceR / 4;
+  int mouthR = faceR / 3;
+
+  if (mood >= 3) {
+    drawIconArc(cx, mouthY - mouthR / 4, mouthR, true);
+  } else if (mood == 2) {
+    drawIconArc(cx, mouthY, mouthR - 2, true);
+  } else if (mood == 1) {
+    M5.Display.drawLine(cx - mouthR, mouthY, cx + mouthR, mouthY, inkColor());
+    M5.Display.drawLine(cx - mouthR, mouthY + 1, cx + mouthR, mouthY + 1, inkColor());
+  } else {
+    drawIconArc(cx, mouthY + mouthR / 4, mouthR - 2, false);
+    int corner = mouthR / 2;
+    M5.Display.drawLine(cx - corner, mouthY + mouthR, cx - 4, mouthY + mouthR / 2, inkColor());
+    M5.Display.drawLine(cx + corner, mouthY + mouthR, cx + 4, mouthY + mouthR / 2, inkColor());
+  }
+}
+
+void drawMoodIcon(int mood) {
+  int cx = 0;
+  int cy = 0;
+  int size = 0;
+  moodIconLayout(&cx, &cy, &size);
+
+  uint16_t ink = inkColor();
+  uint16_t paper = paperColor();
+  int faceR = size / 2;
+
+  M5.Display.fillCircle(cx, cy, faceR, paper);
+  drawBoldCircle(cx, cy, faceR, ink);
+  drawMoodIconEyes(cx, cy, size, mood);
+  drawMoodIconMouth(cx, cy, size, mood);
 }
 
 int smileyMood() {
@@ -361,7 +382,7 @@ void drawDayIndicatorLabel() {
 void drawMainScreen() {
   drawBackground();
 
-  drawSmileyFace(smileyMood());
+  drawMoodIcon(smileyMood());
   drawDayIndicatorBar();
   drawDayIndicatorLabel();
   drawBatteryIndicator();
@@ -385,12 +406,16 @@ void commitDisplay() {
   M5.Display.endWrite();
 }
 
-void refreshMainScreen(bool fast) {
-  M5.Display.setEpdMode(fast ? epd_mode_t::epd_fastest : epd_mode_t::epd_fast);
+void refreshMainScreen(epd_mode_t mode) {
+  M5.Display.setEpdMode(mode);
   M5.Display.startWrite();
   drawMainScreen();
   commitDisplay();
   screenDirty = false;
+}
+
+bool wokeFromDailyTimer() {
+  return esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER;
 }
 
 void enterSelectionScreen() {
@@ -457,7 +482,7 @@ void setup() {
   updateBatteryEstimate();
 
   picker = 0;
-  refreshMainScreen(true);
+  refreshMainScreen(wokeFromDailyTimer() ? epd_mode_t::epd_quality : epd_mode_t::epd_fast);
 
   M5.Speaker.setVolume(0);
 }
@@ -490,12 +515,12 @@ void loop() {
       saveCleaning(picker);
       selecting = false;
       awakeStart = millis();
-      refreshMainScreen(true);
+      refreshMainScreen(epd_mode_t::epd_fastest);
     }
   }
 
   if (!selecting && screenDirty) {
-    refreshMainScreen(true);
+    refreshMainScreen(epd_mode_t::epd_fastest);
   }
 
   if (!selecting && (millis() - awakeStart) >= AWAKE_MS) {
