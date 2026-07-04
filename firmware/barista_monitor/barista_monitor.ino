@@ -411,26 +411,38 @@ void drawSelectionRow(uint8_t index, bool selected) {
   M5.Display.drawString(CLEANERS[index], 100, SELECTION_ROW_Y[index]);
 }
 
+void commitDisplay() {
+  M5.Display.endWrite();
+  M5.Display.waitDisplay();
+}
+
 void refreshMainScreen() {
   M5.Display.setEpdMode(epd_mode_t::epd_quality);
+  M5.Display.waitDisplay();
+  M5.Display.startWrite();
   drawMainScreen();
+  commitDisplay();
   screenDirty = false;
 }
 
 void enterSelectionScreen() {
   M5.Display.setEpdMode(epd_mode_t::epd_fastest);
+  M5.Display.waitDisplay();
+  M5.Display.startWrite();
   M5.Display.fillScreen(TFT_WHITE);
   for (uint8_t i = 0; i < CLEANER_COUNT; i++) {
     drawSelectionRow(i, i == picker);
   }
+  commitDisplay();
 }
 
 void updateSelectionPicker(uint8_t previousPicker) {
   M5.Display.setEpdMode(epd_mode_t::epd_fastest);
+  M5.Display.waitDisplay();
   M5.Display.startWrite();
   drawSelectionRow(previousPicker, false);
   drawSelectionRow(picker, true);
-  M5.Display.endWrite();
+  commitDisplay();
 }
 
 bool dialClicked() {
@@ -526,5 +538,5 @@ void loop() {
     enterSleep();
   }
 
-  delay(selecting ? 1 : 20);
+  delay(selecting ? 1 : 50);
 }
