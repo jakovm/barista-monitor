@@ -4,8 +4,6 @@
 #include <esp_adc_cal.h>
 #include <esp_sleep.h>
 
-#include "emoji_bitmaps.h"
-
 static constexpr const char* NAMESPACE = "coffee";
 static constexpr const char* KEY_LAST_DATE = "lastYmd";
 static constexpr const char* KEY_CLEANER = "cleaner";
@@ -218,106 +216,79 @@ void drawBackground() {
   }
 }
 
-uint32_t emojiCodeForMood(int mood) {
-  switch (mood) {
-    case 3:
-      return 0x1F604;  // 😄
-    case 2:
-      return 0x1F642;  // 🙂
-    case 1:
-      return 0x1F610;  // 😐
-    default:
-      return 0x1F620;  // 😠
-  }
-}
-
-int emojiLayoutSize() {
+int smileyLayoutSize() {
   int maxW = SCREEN_W - (SCREEN_MARGIN * 2);
   int bottomUi = DAY_BAR_H + 4 + DAY_BAND_H + SCREEN_MARGIN;
   int maxH = SCREEN_H - SCREEN_MARGIN - bottomUi;
   return (maxW < maxH) ? maxW : maxH;
 }
 
-void emojiLayoutCenter(int* cx, int* cy) {
+void smileyLayoutCenter(int* cx, int* cy) {
   int bottomUi = DAY_BAR_H + 4 + DAY_BAND_H + SCREEN_MARGIN;
   int areaH = SCREEN_H - SCREEN_MARGIN - bottomUi;
   *cx = SCREEN_W / 2;
   *cy = SCREEN_MARGIN + (areaH / 2);
 }
 
-bool emojiBitmapPixel(const uint8_t* bitmap, int sx, int sy) {
-  if (sx < 0 || sy < 0 || sx >= EMOJI_SIZE || sy >= EMOJI_SIZE) {
-    return false;
-  }
-  uint8_t bits = pgm_read_byte(bitmap + (sy * EMOJI_BYTES_PER_ROW) + (sx / 8));
-  return (bits & (1 << (7 - (sx % 8)))) != 0;
-}
+void drawSmileyMouth(int cx, int cy, int size, int mood) {
+  uint16_t ink = inkColor();
+  uint16_t paper = paperColor();
+  int radius = (size * 22) / 100;
 
-void drawScaledEmoji(int cx, int cy, int size, uint32_t code) {
-  const uint8_t* bitmap = emojiBitmapForCode(code);
-  if (bitmap == nullptr) {
-    return;
-  }
-
-  uint16_t fg = inkColor();
-  int left = cx - (size / 2);
-  int top = cy - (size / 2);
-
-  for (int dy = 0; dy < size; dy++) {
-    int sy = (dy * EMOJI_SIZE) / size;
-    for (int dx = 0; dx < size; dx++) {
-      int sx = (dx * EMOJI_SIZE) / size;
-      if (emojiBitmapPixel(bitmap, sx, sy)) {
-        M5.Display.drawPixel(left + dx, top + dy, fg);
-      }
-    }
+  if (mood >= 3) {
+    M5.Display.drawCircle(cx, cy + radius / 4, radius, ink);
+    M5.Display.drawCircle(cx, cy - radius / 2, radius, paper);
+  } else if (mood == 2) {
+    M5.Display.drawCircle(cx, cy + radius / 8, radius - 2, ink);
+    M5.Display.drawCircle(cx, cy - radius / 2, radius - 2, paper);
+  } else if (mood == 1) {
+    M5.Display.drawLine(cx - radius, cy + radius / 3, cx + radius, cy + radius / 3, ink);
+  } else {
+    M5.Display.drawCircle(cx, cy + radius / 2, radius - 2, ink);
+    M5.Display.drawCircle(cx, cy - radius / 2, radius - 2, paper);
+    M5.Display.drawLine(cx - radius + 4, cy + radius, cx - 4, cy + radius / 3, ink);
+    M5.Display.drawLine(cx + radius - 4, cy + radius, cx + 4, cy + radius / 3, ink);
   }
 }
 
-void drawEmojiEyes(int cx, int cy, int size, int mood) {
-  uint16_t fg = inkColor();
-  int eyeY = cy - (size / 10);
-  int eyeX = (size * 19) / 100;
-  int eyeR = size / 14;
-  if (eyeR < 3) {
-    eyeR = 3;
+void drawSmileyFace(int mood) {
+  int cx = 0;
+  int cy = 0;
+  int size = smileyLayoutSize();
+  smileyLayoutCenter(&cx, &cy);
+
+  uint16_t ink = inkColor();
+  uint16_t paper = paperColor();
+  int faceR = size / 2;
+
+  M5.Display.fillCircle(cx, cy, faceR, paper);
+  M5.Display.drawCircle(cx, cy, faceR, ink);
+  M5.Display.drawCircle(cx, cy, faceR - 1, ink);
+
+  int eyeY = cy - faceR / 4;
+  int eyeX = faceR / 3;
+  int eyeR = faceR / 9;
+  if (eyeR < 4) {
+    eyeR = 4;
   }
 
   if (mood >= 2) {
-    M5.Display.fillCircle(cx - eyeX, eyeY, eyeR, fg);
-    M5.Display.fillCircle(cx + eyeX, eyeY, eyeR, fg);
+    M5.Display.fillCircle(cx - eyeX, eyeY, eyeR, ink);
+    M5.Display.fillCircle(cx + eyeX, eyeY, eyeR, ink);
   } else if (mood == 1) {
     int w = eyeR * 2;
-    M5.Display.fillRect(cx - eyeX - w / 2, eyeY - 1, w, 3, fg);
-    M5.Display.fillRect(cx + eyeX - w / 2, eyeY - 1, w, 3, fg);
+    M5.Display.fillRect(cx - eyeX - w / 2, eyeY - 1, w, 3, ink);
+    M5.Display.fillRect(cx + eyeX - w / 2, eyeY - 1, w, 3, ink);
   } else {
-    int browLen = size / 7;
-    int browDrop = size / 18;
-    M5.Display.drawLine(cx - eyeX - browLen, eyeY - browDrop, cx - eyeX + browLen, eyeY + browDrop, fg);
-    M5.Display.drawLine(cx - eyeX - browLen, eyeY - browDrop + 1, cx - eyeX + browLen, eyeY + browDrop + 1, fg);
-    M5.Display.drawLine(cx + eyeX + browLen, eyeY - browDrop, cx + eyeX - browLen, eyeY + browDrop, fg);
-    M5.Display.drawLine(cx + eyeX + browLen, eyeY - browDrop + 1, cx + eyeX - browLen, eyeY + browDrop + 1, fg);
-    M5.Display.fillCircle(cx - eyeX, eyeY + browDrop, eyeR - 1, fg);
-    M5.Display.fillCircle(cx + eyeX, eyeY + browDrop, eyeR - 1, fg);
+    int browLen = faceR / 3;
+    int browDrop = faceR / 10;
+    M5.Display.drawLine(cx - eyeX - browLen, eyeY - browDrop, cx - eyeX + browLen / 2, eyeY + browDrop, ink);
+    M5.Display.drawLine(cx + eyeX + browLen, eyeY - browDrop, cx + eyeX - browLen / 2, eyeY + browDrop, ink);
+    M5.Display.fillCircle(cx - eyeX, eyeY + browDrop, eyeR - 1, ink);
+    M5.Display.fillCircle(cx + eyeX, eyeY + browDrop, eyeR - 1, ink);
   }
-}
 
-int32_t emojiDrawCallback(lgfx::LGFXBase* gfx, int32_t posX, int32_t posY, uint32_t code, int32_t font_height) {
-  (void)gfx;
-  (void)posX;
-  (void)posY;
-  (void)code;
-  (void)font_height;
-  return EMOJI_SIZE;
-}
-
-void drawSmileyEmoji(int mood) {
-  int cx = 0;
-  int cy = 0;
-  int size = emojiLayoutSize();
-  emojiLayoutCenter(&cx, &cy);
-  drawScaledEmoji(cx, cy, size, emojiCodeForMood(mood));
-  drawEmojiEyes(cx, cy, size, mood);
+  drawSmileyMouth(cx, cy + faceR / 6, size, mood);
 }
 
 int smileyMood() {
@@ -391,7 +362,7 @@ void drawDayIndicatorLabel() {
 void drawMainScreen() {
   drawBackground();
 
-  drawSmileyEmoji(smileyMood());
+  drawSmileyFace(smileyMood());
   drawDayIndicatorBar();
   drawDayIndicatorLabel();
   drawBatteryIndicator();
@@ -491,8 +462,6 @@ void setup() {
   updateBatteryEstimate();
 
   picker = 0;
-  M5.Display.setAttribute(lgfx::v1::utf8_switch, 1);
-  M5.Display.setEmojiCallback(emojiDrawCallback);
   refreshMainScreen();
 
   M5.Speaker.setVolume(0);
