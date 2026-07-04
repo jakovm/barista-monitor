@@ -25,6 +25,9 @@ static constexpr int BEAN_W = 22;
 static constexpr int BEAN_H = 12;
 static constexpr uint16_t AWAKE_MS = 60000;
 static constexpr uint32_t IDLE_TIMER_SEC = 60;
+static constexpr bool DEMO_DAY_PREVIEW = true;
+static constexpr uint8_t DEMO_DAY_COUNT = 10;
+static constexpr uint16_t DEMO_DAY_MS = 3000;
 static constexpr float BAT_WARN_DAYS = 10.0f;
 static constexpr float BAT_FULL_V = 4.10f;
 static constexpr float BAT_EMPTY_V = 3.35f;
@@ -436,6 +439,19 @@ bool wokeFromDailyTimer() {
   return esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER;
 }
 
+void applyPreviewDay(int day) {
+  daysSinceClean = day;
+  inverted = day >= CLEAN_DAYS_INVERT;
+}
+
+void runDayPreviewDemo() {
+  for (int day = 0; day < DEMO_DAY_COUNT; day++) {
+    applyPreviewDay(day);
+    refreshMainScreen(epd_mode_t::epd_fast);
+    delay(DEMO_DAY_MS);
+  }
+}
+
 void enterSelectionScreen() {
   M5.Display.setEpdMode(epd_mode_t::epd_fastest);
   M5.Display.startWrite();
@@ -534,6 +550,12 @@ void setup() {
   updateBatteryEstimate();
 
   picker = 0;
+
+  if (DEMO_DAY_PREVIEW) {
+    runDayPreviewDemo();
+    loadState();
+  }
+
   refreshMainScreen(wokeFromDailyTimer() ? epd_mode_t::epd_quality : epd_mode_t::epd_fast);
 
   M5.Speaker.setVolume(0);
