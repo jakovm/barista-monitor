@@ -21,7 +21,7 @@ static constexpr int SCREEN_H = 200;
 static constexpr int SCREEN_MARGIN = 4;
 static constexpr int DAY_BAND_H = 32;
 static constexpr int DAY_BAR_H = 10;
-static constexpr uint16_t AWAKE_MS = 120000;
+static constexpr uint16_t AWAKE_MS = 30000;
 static constexpr float BAT_WARN_DAYS = 10.0f;
 static constexpr float BAT_FULL_V = 4.10f;
 static constexpr float BAT_EMPTY_V = 3.35f;
@@ -206,11 +206,11 @@ void drawBackground() {
   M5.Display.fillScreen(TFT_WHITE);
   int stage = grayStage();
   if (stage == 1) {
-    for (int y = 0; y < SCREEN_H; y += 6) {
+    for (int y = 0; y < SCREEN_H; y += 8) {
       M5.Display.drawFastHLine(0, y, SCREEN_W, TFT_BLACK);
     }
   } else if (stage == 2) {
-    for (int y = 0; y < SCREEN_H; y += 3) {
+    for (int y = 0; y < SCREEN_H; y += 4) {
       M5.Display.drawFastHLine(0, y, SCREEN_W, TFT_BLACK);
     }
   }
@@ -263,7 +263,6 @@ void drawSmileyFace(int mood) {
 
   M5.Display.fillCircle(cx, cy, faceR, paper);
   M5.Display.drawCircle(cx, cy, faceR, ink);
-  M5.Display.drawCircle(cx, cy, faceR - 1, ink);
 
   int eyeY = cy - faceR / 4;
   int eyeX = faceR / 3;
@@ -352,7 +351,7 @@ void drawDayIndicatorLabel() {
   formatDaysAgo(daysText, sizeof(daysText));
 
   M5.Display.fillRect(0, BAND_Y, SCREEN_W, DAY_BAND_H, inkColor());
-  M5.Display.setTextFont(&fonts::FreeSansBold12pt7b);
+  M5.Display.setTextFont(&fonts::AsciiFont8x16);
   M5.Display.setTextColor(paperColor(), inkColor());
   M5.Display.setTextSize(1);
   M5.Display.setTextDatum(middle_center);
@@ -384,12 +383,10 @@ void drawSelectionRow(uint8_t index, bool selected) {
 
 void commitDisplay() {
   M5.Display.endWrite();
-  M5.Display.waitDisplay();
 }
 
-void refreshMainScreen() {
-  M5.Display.setEpdMode(epd_mode_t::epd_quality);
-  M5.Display.waitDisplay();
+void refreshMainScreen(bool fast) {
+  M5.Display.setEpdMode(fast ? epd_mode_t::epd_fastest : epd_mode_t::epd_fast);
   M5.Display.startWrite();
   drawMainScreen();
   commitDisplay();
@@ -398,7 +395,6 @@ void refreshMainScreen() {
 
 void enterSelectionScreen() {
   M5.Display.setEpdMode(epd_mode_t::epd_fastest);
-  M5.Display.waitDisplay();
   M5.Display.startWrite();
   M5.Display.fillScreen(TFT_WHITE);
   for (uint8_t i = 0; i < CLEANER_COUNT; i++) {
@@ -409,7 +405,6 @@ void enterSelectionScreen() {
 
 void updateSelectionPicker(uint8_t previousPicker) {
   M5.Display.setEpdMode(epd_mode_t::epd_fastest);
-  M5.Display.waitDisplay();
   M5.Display.startWrite();
   drawSelectionRow(previousPicker, false);
   drawSelectionRow(picker, true);
@@ -462,7 +457,7 @@ void setup() {
   updateBatteryEstimate();
 
   picker = 0;
-  refreshMainScreen();
+  refreshMainScreen(true);
 
   M5.Speaker.setVolume(0);
 }
@@ -495,12 +490,12 @@ void loop() {
       saveCleaning(picker);
       selecting = false;
       awakeStart = millis();
-      refreshMainScreen();
+      refreshMainScreen(true);
     }
   }
 
   if (!selecting && screenDirty) {
-    refreshMainScreen();
+    refreshMainScreen(true);
   }
 
   if (!selecting && (millis() - awakeStart) >= AWAKE_MS) {
