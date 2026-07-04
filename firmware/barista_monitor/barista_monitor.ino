@@ -18,6 +18,11 @@ static constexpr uint8_t CLEANER_COUNT = 3;
 
 static constexpr uint8_t CLEAN_DAYS_GRAY_START = 5;
 static constexpr uint8_t CLEAN_DAYS_INVERT = 7;
+static constexpr int SCREEN_W = 200;
+static constexpr int SCREEN_H = 200;
+static constexpr int SCREEN_MARGIN = 4;
+static constexpr int DAY_BAND_H = 32;
+static constexpr int DAY_BAR_H = 10;
 static constexpr uint16_t AWAKE_MS = 120000;
 static constexpr float BAT_WARN_DAYS = 10.0f;
 static constexpr float BAT_FULL_V = 4.10f;
@@ -203,57 +208,116 @@ void drawBackground() {
   M5.Display.fillScreen(TFT_WHITE);
   int stage = grayStage();
   if (stage == 1) {
-    for (int y = 0; y < 200; y += 6) {
-      M5.Display.drawFastHLine(0, y, 200, TFT_BLACK);
+    for (int y = 0; y < SCREEN_H; y += 6) {
+      M5.Display.drawFastHLine(0, y, SCREEN_W, TFT_BLACK);
     }
   } else if (stage == 2) {
-    for (int y = 0; y < 200; y += 3) {
-      M5.Display.drawFastHLine(0, y, 200, TFT_BLACK);
+    for (int y = 0; y < SCREEN_H; y += 3) {
+      M5.Display.drawFastHLine(0, y, SCREEN_W, TFT_BLACK);
     }
   }
 }
 
-const char* emojiForMood(int mood) {
+uint32_t emojiCodeForMood(int mood) {
   switch (mood) {
     case 3:
-      return "\xF0\x9F\x98\x84";  // U+1F604 😄
+      return 0x1F604;  // 😄
     case 2:
-      return "\xF0\x9F\x99\x82";  // U+1F642 🙂
+      return 0x1F642;  // 🙂
     case 1:
-      return "\xF0\x9F\x98\x90";  // U+1F610 😐
+      return 0x1F610;  // 😐
     default:
-      return "\xF0\x9F\x98\xA0";  // U+1F620 😠
+      return 0x1F620;  // 😠
+  }
+}
+
+int emojiLayoutSize() {
+  int maxW = SCREEN_W - (SCREEN_MARGIN * 2);
+  int bottomUi = DAY_BAR_H + 4 + DAY_BAND_H + SCREEN_MARGIN;
+  int maxH = SCREEN_H - SCREEN_MARGIN - bottomUi;
+  return (maxW < maxH) ? maxW : maxH;
+}
+
+void emojiLayoutCenter(int* cx, int* cy) {
+  int bottomUi = DAY_BAR_H + 4 + DAY_BAND_H + SCREEN_MARGIN;
+  int areaH = SCREEN_H - SCREEN_MARGIN - bottomUi;
+  *cx = SCREEN_W / 2;
+  *cy = SCREEN_MARGIN + (areaH / 2);
+}
+
+bool emojiBitmapPixel(const uint8_t* bitmap, int sx, int sy) {
+  if (sx < 0 || sy < 0 || sx >= EMOJI_SIZE || sy >= EMOJI_SIZE) {
+    return false;
+  }
+  uint8_t bits = pgm_read_byte(bitmap + (sy * EMOJI_BYTES_PER_ROW) + (sx / 8));
+  return (bits & (1 << (7 - (sx % 8)))) != 0;
+}
+
+void drawScaledEmoji(int cx, int cy, int size, uint32_t code) {
+  const uint8_t* bitmap = emojiBitmapForCode(code);
+  if (bitmap == nullptr) {
+    return;
+  }
+
+  uint16_t fg = inkColor();
+  int left = cx - (size / 2);
+  int top = cy - (size / 2);
+
+  for (int dy = 0; dy < size; dy++) {
+    int sy = (dy * EMOJI_SIZE) / size;
+    for (int dx = 0; dx < size; dx++) {
+      int sx = (dx * EMOJI_SIZE) / size;
+      if (emojiBitmapPixel(bitmap, sx, sy)) {
+        M5.Display.drawPixel(left + dx, top + dy, fg);
+      }
+    }
+  }
+}
+
+void drawEmojiEyes(int cx, int cy, int size, int mood) {
+  uint16_t fg = inkColor();
+  int eyeY = cy - (size / 10);
+  int eyeX = (size * 19) / 100;
+  int eyeR = size / 14;
+  if (eyeR < 3) {
+    eyeR = 3;
+  }
+
+  if (mood >= 2) {
+    M5.Display.fillCircle(cx - eyeX, eyeY, eyeR, fg);
+    M5.Display.fillCircle(cx + eyeX, eyeY, eyeR, fg);
+  } else if (mood == 1) {
+    int w = eyeR * 2;
+    M5.Display.fillRect(cx - eyeX - w / 2, eyeY - 1, w, 3, fg);
+    M5.Display.fillRect(cx + eyeX - w / 2, eyeY - 1, w, 3, fg);
+  } else {
+    int browLen = size / 7;
+    int browDrop = size / 18;
+    M5.Display.drawLine(cx - eyeX - browLen, eyeY - browDrop, cx - eyeX + browLen, eyeY + browDrop, fg);
+    M5.Display.drawLine(cx - eyeX - browLen, eyeY - browDrop + 1, cx - eyeX + browLen, eyeY + browDrop + 1, fg);
+    M5.Display.drawLine(cx + eyeX + browLen, eyeY - browDrop, cx + eyeX - browLen, eyeY + browDrop, fg);
+    M5.Display.drawLine(cx + eyeX + browLen, eyeY - browDrop + 1, cx + eyeX - browLen, eyeY + browDrop + 1, fg);
+    M5.Display.fillCircle(cx - eyeX, eyeY + browDrop, eyeR - 1, fg);
+    M5.Display.fillCircle(cx + eyeX, eyeY + browDrop, eyeR - 1, fg);
   }
 }
 
 int32_t emojiDrawCallback(lgfx::LGFXBase* gfx, int32_t posX, int32_t posY, uint32_t code, int32_t font_height) {
-  const uint8_t* bitmap = emojiBitmapForCode(code);
-  if (bitmap == nullptr) {
-    return 0;
-  }
-
-  uint16_t fg = inkColor();
-  int32_t top = posY + (font_height - EMOJI_SIZE) / 2;
-
-  for (int row = 0; row < EMOJI_SIZE; row++) {
-    for (int col = 0; col < EMOJI_BYTES_PER_ROW; col++) {
-      uint8_t bits = pgm_read_byte(bitmap + (row * EMOJI_BYTES_PER_ROW) + col);
-      for (int bit = 0; bit < 8; bit++) {
-        if (bits & (1 << (7 - bit))) {
-          gfx->drawPixel(posX + col * 8 + bit, top + row, fg);
-        }
-      }
-    }
-  }
+  (void)gfx;
+  (void)posX;
+  (void)posY;
+  (void)code;
+  (void)font_height;
   return EMOJI_SIZE;
 }
 
-void drawSmileyEmoji(int cx, int cy, int mood) {
-  M5.Display.setTextFont(&fonts::AsciiFont8x16);
-  M5.Display.setTextSize(1);
-  M5.Display.setTextColor(inkColor(), paperColor());
-  M5.Display.setTextDatum(middle_center);
-  M5.Display.drawString(emojiForMood(mood), cx, cy);
+void drawSmileyEmoji(int mood) {
+  int cx = 0;
+  int cy = 0;
+  int size = emojiLayoutSize();
+  emojiLayoutCenter(&cx, &cy);
+  drawScaledEmoji(cx, cy, size, emojiCodeForMood(mood));
+  drawEmojiEyes(cx, cy, size, mood);
 }
 
 int smileyMood() {
@@ -291,45 +355,43 @@ void drawBatteryIndicator() {
 }
 
 void drawDayIndicatorBar() {
-  static constexpr int BAR_Y = 150;
-  static constexpr int BAR_H = 12;
+  static constexpr int BAR_Y = SCREEN_H - DAY_BAND_H - 4 - DAY_BAR_H;
   static constexpr int SEGMENTS = CLEAN_DAYS_INVERT;
   static constexpr int GAP = 2;
 
   uint16_t ink = inkColor();
   uint16_t paper = paperColor();
-  int segW = (200 - GAP * (SEGMENTS + 1)) / SEGMENTS;
+  int segW = (SCREEN_W - GAP * (SEGMENTS + 1)) / SEGMENTS;
 
   for (int i = 0; i < SEGMENTS; i++) {
     int x = GAP + i * (segW + GAP);
     if (daysSinceClean > i) {
-      M5.Display.fillRect(x, BAR_Y, segW, BAR_H, ink);
+      M5.Display.fillRect(x, BAR_Y, segW, DAY_BAR_H, ink);
     } else {
-      M5.Display.drawRect(x, BAR_Y, segW, BAR_H, ink);
-      M5.Display.fillRect(x + 1, BAR_Y + 1, segW - 2, BAR_H - 2, paper);
+      M5.Display.drawRect(x, BAR_Y, segW, DAY_BAR_H, ink);
+      M5.Display.fillRect(x + 1, BAR_Y + 1, segW - 2, DAY_BAR_H - 2, paper);
     }
   }
 }
 
 void drawDayIndicatorLabel() {
-  static constexpr int BAND_Y = 168;
-  static constexpr int BAND_H = 32;
+  static constexpr int BAND_Y = SCREEN_H - DAY_BAND_H;
 
   char daysText[20];
   formatDaysAgo(daysText, sizeof(daysText));
 
-  M5.Display.fillRect(0, BAND_Y, 200, BAND_H, inkColor());
+  M5.Display.fillRect(0, BAND_Y, SCREEN_W, DAY_BAND_H, inkColor());
   M5.Display.setTextFont(&fonts::FreeSansBold12pt7b);
   M5.Display.setTextColor(paperColor(), inkColor());
   M5.Display.setTextSize(1);
   M5.Display.setTextDatum(middle_center);
-  M5.Display.drawString(daysText, 100, BAND_Y + BAND_H / 2);
+  M5.Display.drawString(daysText, SCREEN_W / 2, BAND_Y + DAY_BAND_H / 2);
 }
 
 void drawMainScreen() {
   drawBackground();
 
-  drawSmileyEmoji(100, 78, smileyMood());
+  drawSmileyEmoji(smileyMood());
   drawDayIndicatorBar();
   drawDayIndicatorLabel();
   drawBatteryIndicator();
