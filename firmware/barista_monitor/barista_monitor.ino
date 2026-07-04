@@ -211,37 +211,45 @@ void drawBackground() {
   }
 }
 
-void drawSmiley(int cx, int cy, int mood) {
+void drawSmileyArc(int cx, int cy, int radius, int mood) {
   uint16_t ink = inkColor();
   uint16_t paper = paperColor();
 
-  int eyeY = cy - 12;
-  int mouthY = cy + 14;
-
-  if (mood >= 2) {
-    M5.Display.fillCircle(cx - 16, eyeY, 5, ink);
-    M5.Display.fillCircle(cx + 16, eyeY, 5, ink);
-  } else {
-    M5.Display.drawLine(cx - 20, eyeY - 2, cx - 10, eyeY + 5, ink);
-    M5.Display.drawLine(cx - 10, eyeY + 5, cx - 20, eyeY + 5, ink);
-    M5.Display.drawLine(cx + 20, eyeY - 2, cx + 10, eyeY + 5, ink);
-    M5.Display.drawLine(cx + 10, eyeY + 5, cx + 20, eyeY + 5, ink);
-  }
-
   if (mood >= 3) {
-    M5.Display.drawCircle(cx, mouthY, 18, ink);
-    M5.Display.drawCircle(cx, mouthY - 7, 18, paper);
+    M5.Display.drawCircle(cx, cy - 4, radius, ink);
+    M5.Display.drawCircle(cx, cy - 14, radius, paper);
   } else if (mood == 2) {
-    M5.Display.drawCircle(cx, mouthY - 2, 14, ink);
-    M5.Display.drawCircle(cx, mouthY - 9, 14, paper);
+    M5.Display.drawCircle(cx, cy, radius, ink);
+    M5.Display.drawCircle(cx, cy - 10, radius, paper);
   } else if (mood == 1) {
-    M5.Display.drawLine(cx - 16, mouthY, cx + 16, mouthY, ink);
+    M5.Display.drawLine(cx - radius + 2, cy, cx + radius - 2, cy, ink);
   } else {
-    M5.Display.drawCircle(cx, mouthY + 5, 14, ink);
-    M5.Display.drawCircle(cx, mouthY - 9, 14, paper);
-    M5.Display.drawLine(cx - 12, mouthY + 18, cx + 2, mouthY + 11, ink);
-    M5.Display.drawLine(cx + 12, mouthY + 18, cx - 2, mouthY + 11, ink);
+    M5.Display.drawCircle(cx, cy + 6, radius, ink);
+    M5.Display.drawCircle(cx, cy - 10, radius, paper);
   }
+}
+
+void drawSmileyClassic(int cx, int cy, int mood) {
+  static constexpr int FACE_R = 44;
+  uint16_t ink = inkColor();
+  uint16_t paper = paperColor();
+
+  M5.Display.fillCircle(cx, cy, FACE_R, paper);
+  M5.Display.drawCircle(cx, cy, FACE_R, ink);
+  M5.Display.drawCircle(cx, cy, FACE_R - 1, ink);
+
+  int eyeY = cy - 12;
+  if (mood >= 2) {
+    M5.Display.fillCircle(cx - 15, eyeY, 5, ink);
+    M5.Display.fillCircle(cx + 15, eyeY, 5, ink);
+  } else {
+    M5.Display.drawLine(cx - 22, eyeY - 2, cx - 10, eyeY + 6, ink);
+    M5.Display.drawLine(cx - 10, eyeY + 6, cx - 22, eyeY + 6, ink);
+    M5.Display.drawLine(cx + 22, eyeY - 2, cx + 10, eyeY + 6, ink);
+    M5.Display.drawLine(cx + 10, eyeY + 6, cx + 22, eyeY + 6, ink);
+  }
+
+  drawSmileyArc(cx, cy + 14, 18, mood);
 }
 
 int smileyMood() {
@@ -278,20 +286,48 @@ void drawBatteryIndicator() {
   M5.Display.fillRect(170, 6, 8, 4, ink);
 }
 
-void drawMainScreen() {
-  drawBackground();
+void drawDayIndicatorBar() {
+  static constexpr int BAR_Y = 150;
+  static constexpr int BAR_H = 12;
+  static constexpr int SEGMENTS = CLEAN_DAYS_INVERT;
+  static constexpr int GAP = 2;
 
-  drawSmiley(100, 88, smileyMood());
+  uint16_t ink = inkColor();
+  uint16_t paper = paperColor();
+  int segW = (200 - GAP * (SEGMENTS + 1)) / SEGMENTS;
+
+  for (int i = 0; i < SEGMENTS; i++) {
+    int x = GAP + i * (segW + GAP);
+    if (daysSinceClean > i) {
+      M5.Display.fillRect(x, BAR_Y, segW, BAR_H, ink);
+    } else {
+      M5.Display.drawRect(x, BAR_Y, segW, BAR_H, ink);
+      M5.Display.fillRect(x + 1, BAR_Y + 1, segW - 2, BAR_H - 2, paper);
+    }
+  }
+}
+
+void drawDayIndicatorLabel() {
+  static constexpr int BAND_Y = 168;
+  static constexpr int BAND_H = 32;
 
   char daysText[20];
   formatDaysAgo(daysText, sizeof(daysText));
 
-  M5.Display.setTextFont(&fonts::AsciiFont8x16);
-  M5.Display.setTextColor(inkColor(), paperColor());
+  M5.Display.fillRect(0, BAND_Y, 200, BAND_H, inkColor());
+  M5.Display.setTextFont(&fonts::FreeSansBold12pt7b);
+  M5.Display.setTextColor(paperColor(), inkColor());
   M5.Display.setTextSize(1);
   M5.Display.setTextDatum(middle_center);
-  M5.Display.drawString(daysText, 100, 168);
+  M5.Display.drawString(daysText, 100, BAND_Y + BAND_H / 2);
+}
 
+void drawMainScreen() {
+  drawBackground();
+
+  drawSmileyClassic(100, 78, smileyMood());
+  drawDayIndicatorBar();
+  drawDayIndicatorLabel();
   drawBatteryIndicator();
 }
 
