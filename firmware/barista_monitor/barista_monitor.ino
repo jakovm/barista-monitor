@@ -19,13 +19,13 @@ static constexpr uint8_t CLEAN_DAYS_INVERT = 7;
 static constexpr int SCREEN_W = 200;
 static constexpr int SCREEN_H = 200;
 static constexpr int SCREEN_MARGIN = 4;
-static constexpr int DAY_BAND_H = 32;
+static constexpr int DAY_BAND_H = 36;
 static constexpr int DAY_BAR_H = 14;
 static constexpr int BEAN_W = 22;
 static constexpr int BEAN_H = 12;
 static constexpr uint16_t AWAKE_MS = 60000;
 static constexpr uint32_t IDLE_TIMER_SEC = 60;
-static constexpr bool DEMO_DAY_PREVIEW = true;
+static constexpr bool DEMO_DAY_PREVIEW = false;
 static constexpr uint8_t DEMO_DAY_COUNT = 10;
 static constexpr uint16_t DEMO_DAY_MS = 3000;
 static constexpr float BAT_WARN_DAYS = 10.0f;
@@ -134,7 +134,7 @@ void loadState() {
     daysSinceClean = 0;
   }
 
-  inverted = daysSinceClean >= CLEAN_DAYS_INVERT;
+  inverted = daysSinceClean > CLEAN_DAYS_INVERT;
 }
 
 void saveCleaning(uint8_t cleanerIndex) {
@@ -191,10 +191,10 @@ uint16_t paperColor() {
 }
 
 int grayStage() {
-  if (daysSinceClean >= CLEAN_DAYS_INVERT) {
+  if (daysSinceClean > CLEAN_DAYS_INVERT) {
     return -1;
   }
-  if (daysSinceClean == 6) {
+  if (daysSinceClean >= 6) {
     return 2;
   }
   if (daysSinceClean == 5) {
@@ -240,12 +240,15 @@ void drawBoldCircle(int cx, int cy, int radius, uint16_t ink) {
   if (radius > 3) {
     M5.Display.drawCircle(cx, cy, radius - 2, ink);
   }
+  if (radius > 4) {
+    M5.Display.drawCircle(cx, cy, radius - 3, ink);
+  }
 }
 
 void drawMouthCurve(int cx, int cy, int halfWidth, int depth, bool smile) {
   uint16_t ink = inkColor();
 
-  for (int offset = -1; offset <= 1; offset++) {
+  for (int offset = -2; offset <= 2; offset++) {
     int baseY = cy + offset;
     int controlY = smile ? baseY + depth : baseY - depth;
     M5.Display.drawBezier(cx - halfWidth, baseY, cx, controlY, cx + halfWidth, baseY, ink);
@@ -296,7 +299,7 @@ void drawMoodIconMouth(int cx, int cy, int size, int mood) {
     drawMouthCurve(cx, mouthY, mouthW - 4, faceR / 8, true);
   } else if (mood == 1) {
     uint16_t ink = inkColor();
-    for (int offset = -1; offset <= 1; offset++) {
+    for (int offset = -2; offset <= 2; offset++) {
       M5.Display.drawLine(cx - mouthW, mouthY + offset, cx + mouthW, mouthY + offset, ink);
     }
   } else {
@@ -321,7 +324,7 @@ void drawMoodIcon(int mood) {
 }
 
 int smileyMood() {
-  if (daysSinceClean >= CLEAN_DAYS_INVERT) {
+  if (daysSinceClean > CLEAN_DAYS_INVERT) {
     return 0;
   }
   if (daysSinceClean >= CLEAN_DAYS_GRAY_START) {
@@ -395,7 +398,7 @@ void drawDayIndicatorLabel() {
   M5.Display.fillRect(0, BAND_Y, SCREEN_W, DAY_BAND_H, inkColor());
   M5.Display.setTextFont(&fonts::AsciiFont8x16);
   M5.Display.setTextColor(paperColor(), inkColor());
-  M5.Display.setTextSize(1);
+  M5.Display.setTextSize(2);
   M5.Display.setTextDatum(middle_center);
   M5.Display.drawString(daysText, SCREEN_W / 2, BAND_Y + DAY_BAND_H / 2);
 }
@@ -441,7 +444,7 @@ bool wokeFromDailyTimer() {
 
 void applyPreviewDay(int day) {
   daysSinceClean = day;
-  inverted = day >= CLEAN_DAYS_INVERT;
+  inverted = day > CLEAN_DAYS_INVERT;
 }
 
 void runDayPreviewDemo() {
