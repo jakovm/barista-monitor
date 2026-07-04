@@ -20,7 +20,9 @@ static constexpr int SCREEN_W = 200;
 static constexpr int SCREEN_H = 200;
 static constexpr int SCREEN_MARGIN = 4;
 static constexpr int DAY_BAND_H = 32;
-static constexpr int DAY_BAR_H = 10;
+static constexpr int DAY_BAR_H = 14;
+static constexpr int BEAN_W = 22;
+static constexpr int BEAN_H = 12;
 static constexpr uint16_t AWAKE_MS = 60000;
 static constexpr uint32_t IDLE_TIMER_SEC = 60;
 static constexpr float BAT_WARN_DAYS = 10.0f;
@@ -232,14 +234,19 @@ void drawBoldCircle(int cx, int cy, int radius, uint16_t ink) {
   if (radius > 2) {
     M5.Display.drawCircle(cx, cy, radius - 1, ink);
   }
+  if (radius > 3) {
+    M5.Display.drawCircle(cx, cy, radius - 2, ink);
+  }
 }
 
 void drawMouthCurve(int cx, int cy, int halfWidth, int depth, bool smile) {
   uint16_t ink = inkColor();
-  int controlY = smile ? cy + depth : cy - depth;
 
-  M5.Display.drawBezier(cx - halfWidth, cy, cx, controlY, cx + halfWidth, cy, ink);
-  M5.Display.drawBezier(cx - halfWidth, cy + 1, cx, controlY + 1, cx + halfWidth, cy + 1, ink);
+  for (int offset = -1; offset <= 1; offset++) {
+    int baseY = cy + offset;
+    int controlY = smile ? baseY + depth : baseY - depth;
+    M5.Display.drawBezier(cx - halfWidth, baseY, cx, controlY, cx + halfWidth, baseY, ink);
+  }
 }
 
 void drawMoodIconEyes(int cx, int cy, int size, int mood) {
@@ -285,8 +292,10 @@ void drawMoodIconMouth(int cx, int cy, int size, int mood) {
   } else if (mood == 2) {
     drawMouthCurve(cx, mouthY, mouthW - 4, faceR / 8, true);
   } else if (mood == 1) {
-    M5.Display.drawLine(cx - mouthW, mouthY, cx + mouthW, mouthY, inkColor());
-    M5.Display.drawLine(cx - mouthW, mouthY + 1, cx + mouthW, mouthY + 1, inkColor());
+    uint16_t ink = inkColor();
+    for (int offset = -1; offset <= 1; offset++) {
+      M5.Display.drawLine(cx - mouthW, mouthY + offset, cx + mouthW, mouthY + offset, ink);
+    }
   } else {
     drawMouthCurve(cx, mouthY, mouthW - 4, faceR / 8, false);
   }
@@ -342,23 +351,35 @@ void drawBatteryIndicator() {
   M5.Display.fillRect(170, 6, 8, 4, ink);
 }
 
+void drawCoffeeBean(int cx, int cy, bool filled) {
+  uint16_t ink = inkColor();
+  uint16_t paper = paperColor();
+  int rx = BEAN_W / 2;
+  int ry = BEAN_H / 2;
+
+  if (filled) {
+    M5.Display.fillEllipse(cx, cy, rx, ry, ink);
+    M5.Display.drawLine(cx, cy - ry + 2, cx, cy + ry - 2, paper);
+    M5.Display.drawBezier(cx, cy - ry / 2, cx - rx / 2, cy, cx, cy + ry / 2, paper);
+  } else {
+    M5.Display.drawEllipse(cx, cy, rx, ry, ink);
+    M5.Display.drawEllipse(cx, cy, rx - 1, ry - 1, ink);
+    M5.Display.drawLine(cx, cy - ry + 2, cx, cy + ry - 2, ink);
+    M5.Display.drawBezier(cx, cy - ry / 2, cx - rx / 2, cy, cx, cy + ry / 2, ink);
+  }
+}
+
 void drawDayIndicatorBar() {
   static constexpr int BAR_Y = SCREEN_H - DAY_BAND_H - 4 - DAY_BAR_H;
   static constexpr int SEGMENTS = CLEAN_DAYS_INVERT;
-  static constexpr int GAP = 2;
+  static constexpr int GAP = 4;
 
-  uint16_t ink = inkColor();
-  uint16_t paper = paperColor();
-  int segW = (SCREEN_W - GAP * (SEGMENTS + 1)) / SEGMENTS;
+  int step = (SCREEN_W - GAP * 2 - BEAN_W) / (SEGMENTS - 1);
+  int beanY = BAR_Y + DAY_BAR_H / 2;
 
   for (int i = 0; i < SEGMENTS; i++) {
-    int x = GAP + i * (segW + GAP);
-    if (daysSinceClean > i) {
-      M5.Display.fillRect(x, BAR_Y, segW, DAY_BAR_H, ink);
-    } else {
-      M5.Display.drawRect(x, BAR_Y, segW, DAY_BAR_H, ink);
-      M5.Display.fillRect(x + 1, BAR_Y + 1, segW - 2, DAY_BAR_H - 2, paper);
-    }
+    int cx = GAP + BEAN_W / 2 + i * step;
+    drawCoffeeBean(cx, beanY, daysSinceClean > i);
   }
 }
 
