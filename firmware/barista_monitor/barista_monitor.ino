@@ -36,6 +36,7 @@ static constexpr float BAT_WARN_DAYS = 10.0f;
 static constexpr uint8_t BAT_ALARM_DAYS = 7;
 static constexpr float BAT_FULL_V = 4.10f;
 static constexpr float BAT_EMPTY_V = 3.35f;
+static constexpr int LOGICAL_DAY_START_HOUR = 7;
 
 Preferences prefs;
 bool selecting = false;
@@ -69,9 +70,44 @@ Ymd keyToYmd(uint32_t key) {
   };
 }
 
-Ymd rtcToday() {
+bool isLeapYear(int year) {
+  return (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+}
+
+int daysInMonth(int year, int month) {
+  static constexpr int lengths[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (month == 2 && isLeapYear(year)) {
+    return 29;
+  }
+  return lengths[month - 1];
+}
+
+Ymd previousDay(Ymd ymd) {
+  if (ymd.day > 1) {
+    return {ymd.year, ymd.month, ymd.day - 1};
+  }
+  if (ymd.month > 1) {
+    int month = ymd.month - 1;
+    return {ymd.year, month, daysInMonth(ymd.year, month)};
+  }
+  int year = ymd.year - 1;
+  return {year, 12, 31};
+}
+
+Ymd logicalToday() {
   auto dt = M5.Rtc.getDateTime();
-  return {dt.date.year, dt.date.month, dt.date.date};
+  Ymd today = {dt.date.year, dt.date.month, dt.date.date};
+  if (dt.time.hours < LOGICAL_DAY_START_HOUR) {
+    return previousDay(today);
+  }
+  return today;
+}
+
+void formatRtcDateTime(char* out, size_t outLen) {
+  auto dt = M5.Rtc.getDateTime();
+  snprintf(out, outLen, "%02d.%02d.%04d %02d:%02d",
+           dt.date.date, dt.date.month, dt.date.year,
+           dt.time.hours, dt.time.minutes);
 }
 
 int daysBetween(Ymd from, Ymd to) {
@@ -131,7 +167,7 @@ void initRtcOnce() {
 }
 
 void loadState() {
-  uint32_t today = ymdToKey(rtcToday());
+  uint32_t today = ymdToKey(logicalToday());
   lastCleanYmd = prefs.getUInt(KEY_LAST_DATE, today);
   lastCleaner = prefs.getUChar(KEY_CLEANER, 0);
   if (lastCleaner >= CLEANER_COUNT) {
@@ -147,7 +183,7 @@ void loadState() {
 }
 
 void saveCleaning(uint8_t cleanerIndex) {
-  Ymd today = rtcToday();
+  Ymd today = logicalToday();
   lastCleanYmd = ymdToKey(today);
   lastCleaner = cleanerIndex % CLEANER_COUNT;
   prefs.putUInt(KEY_LAST_DATE, lastCleanYmd);
@@ -514,8 +550,9 @@ void drawMainScreen() {
 
 static constexpr uint8_t SELECTION_ITEM_COUNT = CLEANER_COUNT + 1;
 static constexpr uint8_t SELECTION_BACK_INDEX = CLEANER_COUNT;
-static constexpr int SELECTION_ROW_Y[] = {25, 75, 125, 175};
-static constexpr int SELECTION_ROW_H = 48;
+static constexpr int SELECTION_ROW_Y[] = {22, 58, 94, 130};
+static constexpr int SELECTION_ROW_H = 34;
+static constexpr int SELECTION_DATETIME_Y = 178;
 
 const char* selectionLabel(uint8_t index) {
   if (index < CLEANER_COUNT) {
@@ -533,6 +570,20 @@ void drawSelectionRow(uint8_t index, bool selected) {
   M5.Display.setTextSize(2);
   M5.Display.setTextDatum(middle_center);
   M5.Display.drawString(selectionLabel(index), 100, SELECTION_ROW_Y[index]);
+}
+
+void drawSelectionDateTime() {
+  char dateTimeText[24];
+  formatRtcDateTime(dateTimeText, sizeof(dateTimeText));
+
+  static constexpr int FOOTER_H = 22;
+  int footerY = SELECTION_DATETIME_Y - FOOTER_H / 2;
+  M5.Display.fillRect(0, footerY, SCREEN_W, FOOTER_H, TFT_WHITE);
+  M5.Display.setTextFont(&fonts::AsciiFont8x16);
+  M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.drawString(dateTimeText, SCREEN_W / 2, SELECTION_DATETIME_Y);
 }
 
 void commitDisplay() {
@@ -596,6 +647,7 @@ void enterSelectionScreen() {
   for (uint8_t i = 0; i < SELECTION_ITEM_COUNT; i++) {
     drawSelectionRow(i, i == picker);
   }
+  drawSelectionDateTime();
   commitDisplay();
 }
 

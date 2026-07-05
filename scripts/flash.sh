@@ -6,26 +6,79 @@ export PATH="${HOME}/.local/bin:${PATH}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FQBN="m5stack:esp32:m5stack_coreink"
 SKETCH="${ROOT}/firmware/barista_monitor"
+BUILD="${ROOT}/build"
 PORT="${1:-}"
+WAIT_SECS="${2:-90}"
+UPLOAD_BAUD="${UPLOAD_BAUD:-115200}"
 
 if ! command -v arduino-cli >/dev/null; then
   echo "arduino-cli nicht gefunden." >&2
   exit 1
 fi
 
+find_port() {
+  python3 - <<'PY'
+import glob
+ports = sorted(glob.glob("/dev/cu.usbserial-*"))
+print(ports[0] if ports else "", end="")
+PY
+}
+
 if [[ -z "${PORT}" ]]; then
-  PORT="$(arduino-cli board list | awk '/m5stack_coreink|serial|usbserial/{print $1; exit}')"
+  PORT="$(find_port)"
 fi
 
 if [[ -z "${PORT}" ]]; then
-  echo "Kein CoreInk-Port gefunden. Port als Argument angeben." >&2
+  echo "Warte bis ${WAIT_SECS}s auf CoreInk-USB..."
+  for _ in $(seq 1 "${WAIT_SECS}"); do
+    PORT="$(find_port)"
+    if [[ -n "${PORT}" ]]; then
+      break
+    fi
+    sleep 1
+  done
+fi
+
+if [[ -z "${PORT}" ]]; then
+  echo "Kein CoreInk-Port gefunden. USB prüfen, ggf. Port als Argument angeben." >&2
   exit 1
 fi
 
 echo "Kompiliere barista-monitor..."
-arduino-cli compile --fqbn "${FQBN}" "${SKETCH}"
+arduino-cli compile --fqbn "${FQBN}" --build-path "${BUILD}" "${SKETCH}"
 
-echo "Flashe nach ${PORT}..."
-arduino-cli upload -p "${PORT}" --fqbn "${FQBN}" "${SKETCH}"
+pulse_reset() {
+  python3 - <<PY
+import serial
+import time
 
-echo "Fertig."
+port = "${PORT}"
+with serial.Serial(port, 115200) as ser:
+    ser.setDTR(False)
+    ser.setRTS(True)
+    time.sleep(0.12)
+    ser.setRTS(False)
+    time.sleep(0.5)
+    ser.setDTR(True)
+    time.sleep(0.1)
+PY
+}
+
+upload_once() {
+  arduino-cli upload -p "${PORT}" --fqbn "${FQBN}" --build-path "${BUILD}" \
+    --upload-property "upload.speed=${UPLOAD_BAUD}" "${SKETCH}"
+}
+
+echo "Flashe nach ${PORT} (${UPLOAD_BAUD} baud)..."
+for attempt in 1 2 3 4 5; do
+  echo "Upload-Versuch ${attempt}/5"
+  pulse_reset || true
+  if upload_once; then
+    echo "Fertig."
+    exit 0
+  fi
+  sleep 2
+done
+
+echo "Upload fehlgeschlagen. CoreInk kurz per Knopf wecken und Skript erneut starten." >&2
+exit 1
