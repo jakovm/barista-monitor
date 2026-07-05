@@ -297,15 +297,8 @@ void moodIconLayout(int* cx, int* cy, int* size) {
 }
 
 void drawBoldCircle(int cx, int cy, int radius, uint16_t ink) {
-  M5.Display.drawCircle(cx, cy, radius, ink);
-  if (radius > 2) {
-    M5.Display.drawCircle(cx, cy, radius - 1, ink);
-  }
-  if (radius > 3) {
-    M5.Display.drawCircle(cx, cy, radius - 2, ink);
-  }
-  if (radius > 4) {
-    M5.Display.drawCircle(cx, cy, radius - 3, ink);
+  for (int offset = 0; offset < 6 && radius - offset > 0; offset++) {
+    M5.Display.drawCircle(cx, cy, radius - offset, ink);
   }
 }
 
@@ -550,9 +543,19 @@ void drawMainScreen() {
 
 static constexpr uint8_t SELECTION_ITEM_COUNT = CLEANER_COUNT + 1;
 static constexpr uint8_t SELECTION_BACK_INDEX = CLEANER_COUNT;
-static constexpr int SELECTION_ROW_Y[] = {22, 58, 94, 130};
-static constexpr int SELECTION_ROW_H = 34;
-static constexpr int SELECTION_DATETIME_Y = 178;
+static constexpr int SELECTION_TOP = 2;
+static constexpr int SELECTION_BOTTOM_MARGIN = 2;
+static constexpr int SELECTION_DATETIME_H = 16;
+static constexpr int SELECTION_DATETIME_GAP = 2;
+static constexpr int SELECTION_MENU_BOTTOM =
+    SCREEN_H - SELECTION_BOTTOM_MARGIN - SELECTION_DATETIME_H - SELECTION_DATETIME_GAP;
+static constexpr int SELECTION_MENU_H = SELECTION_MENU_BOTTOM - SELECTION_TOP;
+static constexpr int SELECTION_ROW_H = SELECTION_MENU_H / SELECTION_ITEM_COUNT;
+static constexpr int SELECTION_DATETIME_Y = SCREEN_H - SELECTION_BOTTOM_MARGIN;
+
+int selectionRowCenterY(uint8_t index) {
+  return SELECTION_TOP + ((index * 2 + 1) * SELECTION_MENU_H) / (SELECTION_ITEM_COUNT * 2);
+}
 
 const char* selectionLabel(uint8_t index) {
   if (index < CLEANER_COUNT) {
@@ -562,27 +565,27 @@ const char* selectionLabel(uint8_t index) {
 }
 
 void drawSelectionRow(uint8_t index, bool selected) {
-  int bandY = SELECTION_ROW_Y[index] - SELECTION_ROW_H / 2;
+  int rowY = selectionRowCenterY(index);
+  int bandY = rowY - SELECTION_ROW_H / 2;
 
-  M5.Display.fillRect(0, bandY, 200, SELECTION_ROW_H, selected ? TFT_BLACK : TFT_WHITE);
+  M5.Display.fillRect(0, bandY, SCREEN_W, SELECTION_ROW_H, selected ? TFT_BLACK : TFT_WHITE);
   M5.Display.setTextFont(&fonts::AsciiFont8x16);
   M5.Display.setTextColor(selected ? TFT_WHITE : TFT_BLACK, selected ? TFT_BLACK : TFT_WHITE);
   M5.Display.setTextSize(2);
   M5.Display.setTextDatum(middle_center);
-  M5.Display.drawString(selectionLabel(index), 100, SELECTION_ROW_Y[index]);
+  M5.Display.drawString(selectionLabel(index), SCREEN_W / 2, rowY);
 }
 
 void drawSelectionDateTime() {
   char dateTimeText[24];
   formatRtcDateTime(dateTimeText, sizeof(dateTimeText));
 
-  static constexpr int FOOTER_H = 22;
-  int footerY = SELECTION_DATETIME_Y - FOOTER_H / 2;
-  M5.Display.fillRect(0, footerY, SCREEN_W, FOOTER_H, TFT_WHITE);
+  int footerY = SELECTION_MENU_BOTTOM;
+  M5.Display.fillRect(0, footerY, SCREEN_W, SCREEN_H - footerY, TFT_WHITE);
   M5.Display.setTextFont(&fonts::AsciiFont8x16);
   M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
   M5.Display.setTextSize(1);
-  M5.Display.setTextDatum(middle_center);
+  M5.Display.setTextDatum(bottom_center);
   M5.Display.drawString(dateTimeText, SCREEN_W / 2, SELECTION_DATETIME_Y);
 }
 
