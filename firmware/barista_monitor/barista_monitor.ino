@@ -37,8 +37,8 @@ static constexpr float BAT_WARN_DAYS = 10.0f;
 static constexpr uint8_t BAT_ALARM_DAYS = 7;
 static constexpr float BAT_FULL_V = 4.10f;
 static constexpr float BAT_EMPTY_V = 3.35f;
-/** Täglicher E-Paper-Refresh per Light-Sleep-Timer (Zähler = Kalendertag). */
-static constexpr int DAILY_DISPLAY_REFRESH_HOUR = 4;
+/** Kalenderwechsel + E-Paper-Refresh per Light-Sleep-Timer (Lokalzeit Mitternacht). */
+static constexpr int DAILY_ROLLOVER_HOUR = 0;
 
 Preferences prefs;
 bool selecting = false;
@@ -676,11 +676,11 @@ void enableButtonWakeup() {
   esp_sleep_enable_gpio_wakeup();
 }
 
-/** Sekunden bis zum nächsten Display-Refresh um 04:00 (Kalenderzähler unabhängig). */
+/** Sekunden bis Mitternacht (00:00): Zähler hoch, danach Display. */
 uint32_t secondsUntilNextDailyWake() {
   auto dt = M5.Rtc.getDateTime();
   int secondsNow = dt.time.hours * 3600 + dt.time.minutes * 60 + dt.time.seconds;
-  int secondsTarget = DAILY_DISPLAY_REFRESH_HOUR * 3600;
+  int secondsTarget = DAILY_ROLLOVER_HOUR * 3600;
   int delta = secondsTarget - secondsNow;
   if (delta <= 0) {
     delta += 86400;
@@ -701,7 +701,7 @@ void enterIdleSleep() {
     esp_light_sleep_start();
 
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-    // 04:00: Kalenderstand neu laden (Mitternacht-Wechsel) und Display immer zeichnen.
+    // 00:00: Zähler (Kalendertag), dann Display-Refresh.
     if (cause == ESP_SLEEP_WAKEUP_TIMER) {
       loadState();
       updateBatteryEstimate();
