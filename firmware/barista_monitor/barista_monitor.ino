@@ -230,17 +230,6 @@ void updateBatteryEstimate() {
   batteryLow = batteryEstDays <= BAT_WARN_DAYS;
 }
 
-int batteryPercentEstimate() {
-  int pct = (int)(batteryEstDays / 90.0f * 100.0f + 0.5f);
-  if (pct < 0) {
-    pct = 0;
-  }
-  if (pct > 100) {
-    pct = 100;
-  }
-  return pct;
-}
-
 void formatBatteryDaysRemaining(char* out, size_t outLen) {
   int days = (int)(batteryEstDays + 0.5f);
   if (days < 0) {
@@ -590,10 +579,8 @@ void drawSelectionRow(uint8_t index, bool selected) {
 
 void drawSelectionDateTime() {
   char dateTimeText[24];
-  char pctText[8];
   char daysText[8];
   formatRtcDateTime(dateTimeText, sizeof(dateTimeText));
-  snprintf(pctText, sizeof(pctText), "%d%%", batteryPercentEstimate());
   formatBatteryDaysRemaining(daysText, sizeof(daysText));
 
   static constexpr int FOOTER_PAD_X = 4;
@@ -605,10 +592,7 @@ void drawSelectionDateTime() {
   M5.Display.setTextSize(1);
 
   M5.Display.setTextDatum(bottom_left);
-  M5.Display.drawString(pctText, FOOTER_PAD_X, SELECTION_DATETIME_Y);
-
-  M5.Display.setTextDatum(bottom_center);
-  M5.Display.drawString(dateTimeText, SCREEN_W / 2, SELECTION_DATETIME_Y);
+  M5.Display.drawString(dateTimeText, FOOTER_PAD_X, SELECTION_DATETIME_Y);
 
   M5.Display.setTextDatum(bottom_right);
   M5.Display.drawString(daysText, SCREEN_W - FOOTER_PAD_X, SELECTION_DATETIME_Y);
