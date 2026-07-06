@@ -4,6 +4,7 @@ set -euo pipefail
 export PATH="${HOME}/.local/bin:${PATH}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ENSURE_PORT="${ROOT}/scripts/ensure_serial_port.sh"
 FQBN="m5stack:esp32:m5stack_coreink"
 SKETCH="${ROOT}/firmware/barista_monitor"
 BUILD="${ROOT}/build"
@@ -74,6 +75,7 @@ upload_once() {
 echo "Flashe nach ${PORT} (${UPLOAD_BAUD} baud)..."
 for attempt in 1 2 3 4 5; do
   echo "Upload-Versuch ${attempt}/5"
+  bash "${ENSURE_PORT}" "${PORT}"
   pulse_reset || true
   if upload_once; then
     echo "Fertig (RTC = Lokalzeit beim Build)."
