@@ -37,8 +37,8 @@ static constexpr float BAT_WARN_DAYS = 10.0f;
 static constexpr uint8_t BAT_ALARM_DAYS = 7;
 static constexpr float BAT_FULL_V = 4.10f;
 static constexpr float BAT_EMPTY_V = 3.35f;
-/** Logischer Tageswechsel und täglicher Display-Refresh (Light-Sleep-Timer). */
-static constexpr int LOGICAL_DAY_START_HOUR = 4;
+/** Täglicher E-Paper-Refresh per Light-Sleep-Timer (Zähler = Kalendertag). */
+static constexpr int DAILY_DISPLAY_REFRESH_HOUR = 4;
 
 Preferences prefs;
 bool selecting = false;
@@ -84,25 +84,10 @@ int daysInMonth(int year, int month) {
   return lengths[month - 1];
 }
 
-Ymd previousDay(Ymd ymd) {
-  if (ymd.day > 1) {
-    return {ymd.year, ymd.month, ymd.day - 1};
-  }
-  if (ymd.month > 1) {
-    int month = ymd.month - 1;
-    return {ymd.year, month, daysInMonth(ymd.year, month)};
-  }
-  int year = ymd.year - 1;
-  return {year, 12, 31};
-}
-
-Ymd logicalToday() {
+/** Kalendertag laut RTC (Wechsel um Mitternacht, nicht um 04:00). */
+Ymd calendarToday() {
   auto dt = M5.Rtc.getDateTime();
-  Ymd today = {dt.date.year, dt.date.month, dt.date.date};
-  if (dt.time.hours < LOGICAL_DAY_START_HOUR) {
-    return previousDay(today);
-  }
-  return today;
+  return {dt.date.year, dt.date.month, dt.date.date};
 }
 
 void formatRtcDateTime(char* out, size_t outLen) {
@@ -157,11 +142,11 @@ void ensureBaselineCleanDate() {
   if (prefs.isKey(KEY_LAST_DATE)) {
     return;
   }
-  prefs.putUInt(KEY_LAST_DATE, ymdToKey(logicalToday()));
+  prefs.putUInt(KEY_LAST_DATE, ymdToKey(calendarToday()));
 }
 
 void loadState() {
-  uint32_t today = ymdToKey(logicalToday());
+  uint32_t today = ymdToKey(calendarToday());
   lastCleanYmd = prefs.getUInt(KEY_LAST_DATE, today);
   lastCleaner = prefs.getUChar(KEY_CLEANER, 0);
   if (lastCleaner >= CLEANER_COUNT) {
@@ -177,7 +162,7 @@ void loadState() {
 }
 
 void saveCleaning(uint8_t cleanerIndex) {
-  Ymd today = logicalToday();
+  Ymd today = calendarToday();
   lastCleanYmd = ymdToKey(today);
   lastCleaner = cleanerIndex % CLEANER_COUNT;
   prefs.putUInt(KEY_LAST_DATE, lastCleanYmd);
@@ -691,11 +676,11 @@ void enableButtonWakeup() {
   esp_sleep_enable_gpio_wakeup();
 }
 
-/** Sekunden bis zum nächsten Weckruf um LOGICAL_DAY_START_HOUR (04:00). */
+/** Sekunden bis zum nächsten Display-Refresh um 04:00 (Kalenderzähler unabhängig). */
 uint32_t secondsUntilNextDailyWake() {
   auto dt = M5.Rtc.getDateTime();
   int secondsNow = dt.time.hours * 3600 + dt.time.minutes * 60 + dt.time.seconds;
-  int secondsTarget = LOGICAL_DAY_START_HOUR * 3600;
+  int secondsTarget = DAILY_DISPLAY_REFRESH_HOUR * 3600;
   int delta = secondsTarget - secondsNow;
   if (delta <= 0) {
     delta += 86400;
@@ -716,7 +701,7 @@ void enterIdleSleep() {
     esp_light_sleep_start();
 
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-    // 04:00: Zähler neu laden und Display immer aktualisieren (auch ohne Zustandsänderung).
+    // 04:00: Kalenderstand neu laden (Mitternacht-Wechsel) und Display immer zeichnen.
     if (cause == ESP_SLEEP_WAKEUP_TIMER) {
       loadState();
       updateBatteryEstimate();
