@@ -2,3 +2,4 @@
 *.swp
 build/
 .arduino/
+firmware/barista_monitor/rtc_stamp.h

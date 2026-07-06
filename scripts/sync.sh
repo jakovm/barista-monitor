@@ -40,13 +40,13 @@ if [[ -z "${PORT}" ]]; then
 fi
 
 if [[ -z "${PORT}" ]]; then
-  echo "Kein CoreInk-Port gefunden. USB prüfen, ggf. Port als Argument angeben." >&2
+  echo "Kein CoreInk-Port gefunden." >&2
   exit 1
 fi
 
 python3 "${ROOT}/scripts/write_rtc_stamp.py"
 
-echo "Kompiliere barista-monitor..."
+echo "Kompiliere mit aktueller Lokalzeit..."
 arduino-cli compile --fqbn "${FQBN}" --build-path "${BUILD}" "${SKETCH}"
 
 pulse_reset() {
@@ -55,32 +55,33 @@ import serial
 import time
 
 port = "${PORT}"
-with serial.Serial(port, 115200) as ser:
-    ser.setDTR(False)
-    ser.setRTS(True)
-    time.sleep(0.12)
-    ser.setRTS(False)
-    time.sleep(0.5)
-    ser.setDTR(True)
-    time.sleep(0.1)
+ser = serial.Serial()
+ser.port = port
+ser.baudrate = 115200
+ser.dtr = False
+ser.rts = False
+ser.open()
+ser.setRTS(True)
+time.sleep(0.12)
+ser.setRTS(False)
+time.sleep(0.5)
+ser.setDTR(True)
+time.sleep(0.1)
+ser.close()
 PY
-}
-
-upload_once() {
-  arduino-cli upload -p "${PORT}" --fqbn "${FQBN}" --build-path "${BUILD}" \
-    --upload-property "upload.speed=${UPLOAD_BAUD}" "${SKETCH}"
 }
 
 echo "Flashe nach ${PORT} (${UPLOAD_BAUD} baud)..."
 for attempt in 1 2 3 4 5; do
   echo "Upload-Versuch ${attempt}/5"
   pulse_reset || true
-  if upload_once; then
-    echo "Fertig (RTC = Lokalzeit beim Build)."
+  if arduino-cli upload -p "${PORT}" --fqbn "${FQBN}" --build-path "${BUILD}" \
+    --upload-property "upload.speed=${UPLOAD_BAUD}" "${SKETCH}"; then
+    echo "Sync fertig (RTC = Lokalzeit beim Build)."
     exit 0
   fi
   sleep 2
 done
 
-echo "Upload fehlgeschlagen. CoreInk kurz per Knopf wecken und Skript erneut starten." >&2
+echo "Sync fehlgeschlagen." >&2
 exit 1

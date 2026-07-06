@@ -3,6 +3,7 @@
 #include <WiFi.h>
 #include <esp_adc_cal.h>
 #include <esp_sleep.h>
+#include "rtc_stamp.h"
 
 static constexpr const char* NAMESPACE = "coffee";
 static constexpr const char* KEY_LAST_DATE = "lastYmd";
@@ -36,7 +37,7 @@ static constexpr float BAT_WARN_DAYS = 10.0f;
 static constexpr uint8_t BAT_ALARM_DAYS = 7;
 static constexpr float BAT_FULL_V = 4.10f;
 static constexpr float BAT_EMPTY_V = 3.35f;
-static constexpr int LOGICAL_DAY_START_HOUR = 7;
+static constexpr int LOGICAL_DAY_START_HOUR = 4;
 
 Preferences prefs;
 bool selecting = false;
@@ -124,36 +125,7 @@ int daysBetween(Ymd from, Ymd to) {
   return toDays(to) - toDays(from);
 }
 
-void initRtcOnce() {
-  if (prefs.getBool(KEY_RTC_INIT, false)) {
-    return;
-  }
-
-  const char* dateStr = __DATE__;
-  const char* timeStr = __TIME__;
-  const char* months[] = {
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-  };
-
-  char monthName[4] = {0};
-  int day = 1;
-  int year = 2026;
-  sscanf(dateStr, "%3s %d %d", monthName, &day, &year);
-
-  int month = 1;
-  for (int i = 0; i < 12; i++) {
-    if (strncmp(monthName, months[i], 3) == 0) {
-      month = i + 1;
-      break;
-    }
-  }
-
-  int hour = 0;
-  int minute = 0;
-  int second = 0;
-  sscanf(timeStr, "%d:%d:%d", &hour, &minute, &second);
-
+bool applyRtcDateTime(int year, int month, int day, int hour, int minute, int second) {
   m5::rtc_datetime_t dt = {};
   dt.date.year = year;
   dt.date.month = month;
@@ -164,6 +136,27 @@ void initRtcOnce() {
   dt.time.seconds = second;
   M5.Rtc.setDateTime(dt);
   prefs.putBool(KEY_RTC_INIT, true);
+  return true;
+}
+
+/** RTC aus Host-Lokalzeit beim letzten flash/sync (rtc_stamp.h). */
+void applyRtcFromBuildStamp() {
+  applyRtcDateTime(
+    RTC_STAMP_YEAR,
+    RTC_STAMP_MONTH,
+    RTC_STAMP_DAY,
+    RTC_STAMP_HOUR,
+    RTC_STAMP_MIN,
+    RTC_STAMP_SEC
+  );
+}
+
+/** Erster Lauf: Starttag persistieren, damit Tage ab Flash/Reboot mitzählen. */
+void ensureBaselineCleanDate() {
+  if (prefs.isKey(KEY_LAST_DATE)) {
+    return;
+  }
+  prefs.putUInt(KEY_LAST_DATE, ymdToKey(logicalToday()));
 }
 
 void loadState() {
@@ -235,6 +228,25 @@ void updateBatteryEstimate() {
 
   batteryEstDays = remainingFrac * 90.0f;
   batteryLow = batteryEstDays <= BAT_WARN_DAYS;
+}
+
+int batteryPercentEstimate() {
+  int pct = (int)(batteryEstDays / 90.0f * 100.0f + 0.5f);
+  if (pct < 0) {
+    pct = 0;
+  }
+  if (pct > 100) {
+    pct = 100;
+  }
+  return pct;
+}
+
+void formatBatteryDaysRemaining(char* out, size_t outLen) {
+  int days = (int)(batteryEstDays + 0.5f);
+  if (days < 0) {
+    days = 0;
+  }
+  snprintf(out, outLen, "T-%d", days);
 }
 
 uint16_t inkColor() {
@@ -578,15 +590,28 @@ void drawSelectionRow(uint8_t index, bool selected) {
 
 void drawSelectionDateTime() {
   char dateTimeText[24];
+  char pctText[8];
+  char daysText[8];
   formatRtcDateTime(dateTimeText, sizeof(dateTimeText));
+  snprintf(pctText, sizeof(pctText), "%d%%", batteryPercentEstimate());
+  formatBatteryDaysRemaining(daysText, sizeof(daysText));
+
+  static constexpr int FOOTER_PAD_X = 4;
 
   int footerY = SELECTION_MENU_BOTTOM;
   M5.Display.fillRect(0, footerY, SCREEN_W, SCREEN_H - footerY, TFT_WHITE);
   M5.Display.setTextFont(&fonts::AsciiFont8x16);
   M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
   M5.Display.setTextSize(1);
+
+  M5.Display.setTextDatum(bottom_left);
+  M5.Display.drawString(pctText, FOOTER_PAD_X, SELECTION_DATETIME_Y);
+
   M5.Display.setTextDatum(bottom_center);
   M5.Display.drawString(dateTimeText, SCREEN_W / 2, SELECTION_DATETIME_Y);
+
+  M5.Display.setTextDatum(bottom_right);
+  M5.Display.drawString(daysText, SCREEN_W - FOOTER_PAD_X, SELECTION_DATETIME_Y);
 }
 
 void commitDisplay() {
@@ -644,6 +669,7 @@ void runBatteryPreviewDemo() {
 }
 
 void enterSelectionScreen() {
+  updateBatteryEstimate();
   M5.Display.setEpdMode(epd_mode_t::epd_fastest);
   M5.Display.startWrite();
   M5.Display.fillScreen(TFT_WHITE);
@@ -683,7 +709,7 @@ void enableButtonWakeup() {
 uint32_t secondsUntilNextDailyWake() {
   auto dt = M5.Rtc.getDateTime();
   int secondsNow = dt.time.hours * 3600 + dt.time.minutes * 60 + dt.time.seconds;
-  int secondsTarget = 7 * 3600;
+  int secondsTarget = LOGICAL_DAY_START_HOUR * 3600;
   int delta = secondsTarget - secondsNow;
   if (delta <= 0) {
     delta += 86400;
@@ -707,7 +733,7 @@ void enterIdleSleep() {
     if (cause == ESP_SLEEP_WAKEUP_TIMER) {
       loadState();
       updateBatteryEstimate();
-      if (!selecting && displayNeedsRefresh()) {
+      if (!selecting) {
         M5.Display.wakeup();
         refreshMainScreen(epd_mode_t::epd_fast);
         M5.Display.sleep();
@@ -716,9 +742,14 @@ void enterIdleSleep() {
     }
 
     if (cause == ESP_SLEEP_WAKEUP_GPIO || cause == ESP_SLEEP_WAKEUP_EXT1 || cause == ESP_SLEEP_WAKEUP_EXT0) {
+      loadState();
+      updateBatteryEstimate();
       M5.Display.wakeup();
       delay(30);
       M5.update();
+      if (!selecting && displayNeedsRefresh()) {
+        refreshMainScreen(epd_mode_t::epd_fast);
+      }
       return;
     }
   }
@@ -733,7 +764,8 @@ void setup() {
   M5.Power.setLed(0);
 
   prefs.begin(NAMESPACE, false);
-  initRtcOnce();
+  applyRtcFromBuildStamp();
+  ensureBaselineCleanDate();
   migrateDiagnostics();
   loadState();
   updateBatteryEstimate();
