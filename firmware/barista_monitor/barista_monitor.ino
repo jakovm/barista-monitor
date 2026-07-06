@@ -37,6 +37,7 @@ static constexpr float BAT_WARN_DAYS = 10.0f;
 static constexpr uint8_t BAT_ALARM_DAYS = 7;
 static constexpr float BAT_FULL_V = 4.10f;
 static constexpr float BAT_EMPTY_V = 3.35f;
+/** Logischer Tageswechsel und täglicher Display-Refresh (Light-Sleep-Timer). */
 static constexpr int LOGICAL_DAY_START_HOUR = 4;
 
 Preferences prefs;
@@ -690,6 +691,7 @@ void enableButtonWakeup() {
   esp_sleep_enable_gpio_wakeup();
 }
 
+/** Sekunden bis zum nächsten Weckruf um LOGICAL_DAY_START_HOUR (04:00). */
 uint32_t secondsUntilNextDailyWake() {
   auto dt = M5.Rtc.getDateTime();
   int secondsNow = dt.time.hours * 3600 + dt.time.minutes * 60 + dt.time.seconds;
@@ -714,6 +716,7 @@ void enterIdleSleep() {
     esp_light_sleep_start();
 
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    // 04:00: Zähler neu laden und Display immer aktualisieren (auch ohne Zustandsänderung).
     if (cause == ESP_SLEEP_WAKEUP_TIMER) {
       loadState();
       updateBatteryEstimate();
