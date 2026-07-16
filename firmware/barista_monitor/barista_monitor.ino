@@ -12,6 +12,7 @@ static constexpr const char* KEY_RTC_INIT = "rtcInit";
 static constexpr const char* KEY_BOOT_COUNT = "boots";
 static constexpr const char* KEY_VOLT_EMA = "voltEma";
 static constexpr const char* KEY_DIAG_VERSION = "diagVer";
+static constexpr const char* KEY_RTC_STAMP = "rtcStamp";
 static constexpr uint8_t DIAG_VERSION = 1;
 
 static constexpr const char* CLEANERS[] = {"Jakov", "Nina", "Guest"};
@@ -125,8 +126,20 @@ bool applyRtcDateTime(int year, int month, int day, int hour, int minute, int se
   return true;
 }
 
-/** RTC aus Host-Lokalzeit beim letzten flash/sync (rtc_stamp.h). */
-void applyRtcFromBuildStamp() {
+uint32_t buildStampKey() {
+  return (uint32_t)RTC_STAMP_YEAR * 100000000u
+       + (uint32_t)RTC_STAMP_MONTH * 1000000u
+       + (uint32_t)RTC_STAMP_DAY * 10000u
+       + (uint32_t)RTC_STAMP_HOUR * 100u
+       + (uint32_t)RTC_STAMP_MIN;
+}
+
+/** RTC nur beim ersten Lauf oder nach neuem Flash (rtc_stamp.h), nicht bei jedem Reboot. */
+void ensureRtcFromBuildStamp() {
+  uint32_t stampKey = buildStampKey();
+  if (prefs.getUInt(KEY_RTC_STAMP, 0u) == stampKey) {
+    return;
+  }
   applyRtcDateTime(
     RTC_STAMP_YEAR,
     RTC_STAMP_MONTH,
@@ -135,6 +148,7 @@ void applyRtcFromBuildStamp() {
     RTC_STAMP_MIN,
     RTC_STAMP_SEC
   );
+  prefs.putUInt(KEY_RTC_STAMP, stampKey);
 }
 
 /** Erster Lauf: Starttag persistieren, damit Tage ab Flash/Reboot mitzählen. */
@@ -693,38 +707,12 @@ void enterIdleSleep() {
   M5.Power.setLed(0);
   WiFi.mode(WIFI_OFF);
 
-  while (true) {
-    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-    enableButtonWakeup();
-    esp_sleep_enable_timer_wakeup((uint64_t)secondsUntilNextDailyWake() * 1000000ULL);
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+  enableButtonWakeup();
+  esp_sleep_enable_timer_wakeup((uint64_t)secondsUntilNextDailyWake() * 1000000ULL);
 
-    esp_light_sleep_start();
-
-    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-    // 00:00: Zähler (Kalendertag), dann Display-Refresh.
-    if (cause == ESP_SLEEP_WAKEUP_TIMER) {
-      loadState();
-      updateBatteryEstimate();
-      if (!selecting) {
-        M5.Display.wakeup();
-        refreshMainScreen(epd_mode_t::epd_fast);
-        M5.Display.sleep();
-      }
-      continue;
-    }
-
-    if (cause == ESP_SLEEP_WAKEUP_GPIO || cause == ESP_SLEEP_WAKEUP_EXT1 || cause == ESP_SLEEP_WAKEUP_EXT0) {
-      loadState();
-      updateBatteryEstimate();
-      M5.Display.wakeup();
-      delay(30);
-      M5.update();
-      if (!selecting && displayNeedsRefresh()) {
-        refreshMainScreen(epd_mode_t::epd_fast);
-      }
-      return;
-    }
-  }
+  delay(100);
+  esp_deep_sleep_start();
 }
 
 void setup() {
@@ -736,7 +724,7 @@ void setup() {
   M5.Power.setLed(0);
 
   prefs.begin(NAMESPACE, false);
-  applyRtcFromBuildStamp();
+  ensureRtcFromBuildStamp();
   ensureBaselineCleanDate();
   migrateDiagnostics();
   loadState();
@@ -754,7 +742,9 @@ void setup() {
     updateBatteryEstimate();
   }
 
-  refreshMainScreen(wokeFromDailyTimer() ? epd_mode_t::epd_quality : epd_mode_t::epd_fast);
+  if (!DEMO_DAY_PREVIEW && !DEMO_BATTERY_PREVIEW) {
+    refreshMainScreen(epd_mode_t::epd_fast);
+  }
 
   M5.Speaker.setVolume(0);
 }
