@@ -3,6 +3,7 @@
 #include <WiFi.h>
 #include <esp_adc_cal.h>
 #include <esp_sleep.h>
+#include <esp_task_wdt.h>
 #include "rtc_stamp.h"
 
 static constexpr const char* NAMESPACE = "coffee";
@@ -26,6 +27,8 @@ static constexpr int DAY_BAR_H = 14;
 static constexpr int BEAN_W = 22;
 static constexpr int BEAN_H = 12;
 static constexpr uint16_t AWAKE_MS = 60000;
+/** Task-WDT: bei hängendem E-Paper-Refresh Neustart statt Dauer-Freeze. */
+static constexpr uint32_t WDT_TIMEOUT_MS = 30000;
 static constexpr bool DEMO_DAY_PREVIEW = false;
 static constexpr uint8_t DEMO_DAY_COUNT = 10;
 static constexpr uint16_t DEMO_DAY_MS = 3000;
@@ -593,6 +596,7 @@ void drawSelectionDateTime() {
 
 void commitDisplay() {
   M5.Display.endWrite();
+  M5.Display.waitDisplay();
 }
 
 void syncRenderedState() {
@@ -600,17 +604,55 @@ void syncRenderedState() {
   lastRenderedBatteryLow = batteryLow;
 }
 
+void feedWatchdog() {
+  esp_task_wdt_reset();
+}
+
 void refreshMainScreen(epd_mode_t mode) {
+  feedWatchdog();
   M5.Display.setEpdMode(mode);
   M5.Display.startWrite();
   drawMainScreen();
   commitDisplay();
   screenDirty = false;
   syncRenderedState();
+  feedWatchdog();
 }
 
 bool isTimerWake(esp_sleep_wakeup_cause_t cause) {
   return cause == ESP_SLEEP_WAKEUP_TIMER;
+}
+
+bool isButtonWake(esp_sleep_wakeup_cause_t cause) {
+  return cause == ESP_SLEEP_WAKEUP_GPIO
+      || cause == ESP_SLEEP_WAKEUP_EXT0
+      || cause == ESP_SLEEP_WAKEUP_EXT1;
+}
+
+void setupWatchdog() {
+  esp_task_wdt_config_t cfg = {
+    .timeout_ms = WDT_TIMEOUT_MS,
+    .idle_core_mask = 0,
+    .trigger_panic = true,
+  };
+  // reconfigure falls WDT schon läuft (Arduino-Start), sonst init
+  if (esp_task_wdt_reconfigure(&cfg) != ESP_OK) {
+    esp_task_wdt_init(&cfg);
+  }
+  esp_task_wdt_add(NULL);
+}
+
+/** Warten bis Tasten losgelassen — verhindert sofortiges Re-Wake aus Sleep. */
+void waitButtonsReleased(uint32_t maxMs) {
+  uint32_t start = millis();
+  while ((millis() - start) < maxMs) {
+    M5.update();
+    if (!userActive()) {
+      return;
+    }
+    feedWatchdog();
+    delay(10);
+  }
 }
 
 void applyPreviewDay(int day) {
@@ -669,7 +711,12 @@ bool userActive() {
       || M5.BtnPWR.isPressed() || M5.BtnEXT.isPressed();
 }
 
-void enableButtonWakeup() {
+/**
+ * Button-Wake für Light-Sleep (alle Tasten inkl. GPIO5).
+ * Hinweis: esp_sleep_enable_gpio_wakeup() wirkt nur im Light-Sleep —
+ * im Deep-Sleep wäre das ein „Freeze“ (nur Mitternacht weckt).
+ */
+void enableButtonWakeupLightSleep() {
   static constexpr gpio_num_t WAKE_PINS[] = {
     GPIO_NUM_37, GPIO_NUM_38, GPIO_NUM_39, GPIO_NUM_27, GPIO_NUM_5,
   };
@@ -679,6 +726,16 @@ void enableButtonWakeup() {
     gpio_wakeup_enable(pin, GPIO_INTR_LOW_LEVEL);
   }
   esp_sleep_enable_gpio_wakeup();
+}
+
+/**
+ * Button-Wake für Deep-Sleep (ESP32 classic: EXT0 = genau ein RTC-Pin, aktiv low).
+ * GPIO37 = BtnA (Dial). Weitere Tasten: Light-Sleep-Pfad oben.
+ */
+void enableButtonWakeupDeepSleep() {
+  static constexpr gpio_num_t DEEP_WAKE_PIN = GPIO_NUM_37;
+  gpio_set_pull_mode(DEEP_WAKE_PIN, GPIO_PULLUP_ONLY);
+  esp_sleep_enable_ext0_wakeup(DEEP_WAKE_PIN, 0);
 }
 
 /** Sekunden bis Mitternacht (00:00): Zähler hoch, danach Display. */
@@ -693,17 +750,68 @@ uint32_t secondsUntilNextDailyWake() {
   return (uint32_t)delta;
 }
 
+/**
+ * Idle-Schlaf ohne E-Paper-Refresh im Sleep-Kontext.
+ *
+ * Früher: Light-Sleep-Schleife + Display-Refresh nach Timer → E-Paper-Hänger.
+ * Danach: reiner Deep-Sleep, aber gpio_wakeup greift dort nicht → Tasten tot.
+ *
+ * Jetzt:
+ * - Light-Sleep mit GPIO-Wake (alle Tasten), kein Display-Refresh hier
+ * - Mitternachts-Timer → esp_restart() und frischer setup()-Refresh
+ * - Fallback: Deep-Sleep mit EXT0 (BtnA) falls Light-Sleep scheitert
+ */
 void enterIdleSleep() {
   M5.Display.sleep();
+  M5.Display.waitDisplay();
   M5.Power.setLed(0);
   WiFi.mode(WIFI_OFF);
 
-  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-  enableButtonWakeup();
-  esp_sleep_enable_timer_wakeup((uint64_t)secondsUntilNextDailyWake() * 1000000ULL);
+  waitButtonsReleased(2000);
 
-  delay(100);
-  esp_deep_sleep_start();
+  uint8_t lightSleepFails = 0;
+  while (true) {
+    feedWatchdog();
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    enableButtonWakeupLightSleep();
+    esp_sleep_enable_timer_wakeup((uint64_t)secondsUntilNextDailyWake() * 1000000ULL);
+
+    esp_err_t err = esp_light_sleep_start();
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+
+    if (cause == ESP_SLEEP_WAKEUP_TIMER) {
+      // Sauberer Boot vor jedem Mitternachts-E-Paper-Refresh (kein Hang-Kontext).
+      esp_restart();
+    }
+
+    if (isButtonWake(cause)) {
+      M5.Display.wakeup();
+      delay(30);
+      M5.update();
+      int prevDays = lastRenderedDaysSinceClean;
+      bool prevBat = lastRenderedBatteryLow;
+      loadState();
+      updateBatteryEstimate(false);
+      // Tageswechsel ohne Timer (selten): nur per Clean-Boot refreshen.
+      if (daysSinceClean != prevDays || batteryLow != prevBat) {
+        esp_restart();
+      }
+      return;
+    }
+
+    // Unerwarteter Wake / Fehler → nach wenigen Versuchen Deep-Sleep-Fallback (BtnA + Timer).
+    lightSleepFails++;
+    if (err != ESP_OK) {
+      delay(50);
+    }
+    if (lightSleepFails >= 3) {
+      esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+      enableButtonWakeupDeepSleep();
+      esp_sleep_enable_timer_wakeup((uint64_t)secondsUntilNextDailyWake() * 1000000ULL);
+      delay(50);
+      esp_deep_sleep_start();
+    }
+  }
 }
 
 void setup() {
@@ -716,12 +824,17 @@ void setup() {
   WiFi.disconnect(true, true);
   M5.Power.setLed(0);
 
+  setupWatchdog();
+
   prefs.begin(NAMESPACE, false);
   ensureRtcFromBuildStamp();
   ensureBaselineCleanDate();
   migrateDiagnostics();
   loadState();
-  updateBatteryEstimate(isTimerWake(wakeCause));
+  // Nach esp_restart() aus Timer-Wake ist cause UNDEFINED — EMA trotzdem sichern,
+  // wenn wir den Tag frisch laden (Mitternacht / Kaltstart).
+  bool persistBattery = isTimerWake(wakeCause) || wakeCause == ESP_SLEEP_WAKEUP_UNDEFINED;
+  updateBatteryEstimate(persistBattery);
 
   picker = 0;
 
@@ -736,7 +849,8 @@ void setup() {
   }
 
   if (!DEMO_DAY_PREVIEW && !DEMO_BATTERY_PREVIEW) {
-    // E-Paper hält das Bild im Deep-Sleep — Knopf-Wake braucht keinen Refresh.
+    // E-Paper hält das Bild — reiner Knopf-Wake (EXT0/GPIO) ohne Refresh.
+    // Timer und Kaltstart/Restart: Display aktualisieren (Tageszähler).
     if (isTimerWake(wakeCause) || wakeCause == ESP_SLEEP_WAKEUP_UNDEFINED) {
       refreshMainScreen(epd_mode_t::epd_fast);
     } else {
@@ -745,11 +859,13 @@ void setup() {
   }
 
   M5.Speaker.setVolume(0);
+  feedWatchdog();
 }
 
 void loop() {
   static uint32_t awakeStart = millis();
 
+  feedWatchdog();
   M5.update();
 
   if (userActive()) {
@@ -791,7 +907,13 @@ void loop() {
     refreshMainScreen(epd_mode_t::epd_fastest);
   }
 
-  if (!selecting && (millis() - awakeStart) >= AWAKE_MS) {
+  // Auch im Auswahlmenü nach Idle schlafen — sonst „hängend“ wach bis Akku leer.
+  if ((millis() - awakeStart) >= AWAKE_MS) {
+    if (selecting) {
+      selecting = false;
+      screenDirty = true;
+      refreshMainScreen(epd_mode_t::epd_fastest);
+    }
     enterIdleSleep();
     awakeStart = millis();
   }
