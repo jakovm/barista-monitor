@@ -8,8 +8,6 @@
 static constexpr const char* NAMESPACE = "coffee";
 static constexpr const char* KEY_LAST_DATE = "lastYmd";
 static constexpr const char* KEY_CLEANER = "cleaner";
-static constexpr const char* KEY_RTC_INIT = "rtcInit";
-static constexpr const char* KEY_BOOT_COUNT = "boots";
 static constexpr const char* KEY_VOLT_EMA = "voltEma";
 static constexpr const char* KEY_DIAG_VERSION = "diagVer";
 static constexpr const char* KEY_RTC_STAMP = "rtcStamp";
@@ -38,8 +36,9 @@ static constexpr float BAT_WARN_DAYS = 10.0f;
 static constexpr uint8_t BAT_ALARM_DAYS = 7;
 static constexpr float BAT_FULL_V = 4.10f;
 static constexpr float BAT_EMPTY_V = 3.35f;
-/** Kalenderwechsel + E-Paper-Refresh per Light-Sleep-Timer (Lokalzeit Mitternacht). */
+/** Kalenderwechsel per Deep-Sleep-Timer (Lokalzeit Mitternacht). */
 static constexpr int DAILY_ROLLOVER_HOUR = 0;
+static constexpr float BAT_EMA_PERSIST_DELTA = 0.02f;
 
 Preferences prefs;
 bool selecting = false;
@@ -73,19 +72,7 @@ Ymd keyToYmd(uint32_t key) {
   };
 }
 
-bool isLeapYear(int year) {
-  return (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-}
-
-int daysInMonth(int year, int month) {
-  static constexpr int lengths[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-  if (month == 2 && isLeapYear(year)) {
-    return 29;
-  }
-  return lengths[month - 1];
-}
-
-/** Kalendertag laut RTC (Wechsel um Mitternacht, nicht um 04:00). */
+/** Kalendertag laut RTC (Wechsel um Mitternacht). */
 Ymd calendarToday() {
   auto dt = M5.Rtc.getDateTime();
   return {dt.date.year, dt.date.month, dt.date.date};
@@ -122,7 +109,6 @@ bool applyRtcDateTime(int year, int month, int day, int hour, int minute, int se
   dt.time.minutes = minute;
   dt.time.seconds = second;
   M5.Rtc.setDateTime(dt);
-  prefs.putBool(KEY_RTC_INIT, true);
   return true;
 }
 
@@ -203,20 +189,12 @@ void migrateDiagnostics() {
     return;
   }
 
-  prefs.remove(KEY_BOOT_COUNT);
+  prefs.remove("boots");
   prefs.remove(KEY_VOLT_EMA);
   prefs.putUChar(KEY_DIAG_VERSION, DIAG_VERSION);
 }
 
-void updateBatteryEstimate() {
-  float volts = readBatteryVoltage();
-  uint32_t boots = prefs.getUInt(KEY_BOOT_COUNT, 0u) + 1u;
-  prefs.putUInt(KEY_BOOT_COUNT, boots);
-
-  float ema = prefs.getFloat(KEY_VOLT_EMA, volts);
-  ema = (ema <= 0.1f) ? volts : (ema * 0.92f + volts * 0.08f);
-  prefs.putFloat(KEY_VOLT_EMA, ema);
-
+void applyBatteryFromEma(float ema) {
   float span = BAT_FULL_V - BAT_EMPTY_V;
   float remainingFrac = (ema - BAT_EMPTY_V) / span;
   if (remainingFrac < 0.0f) {
@@ -228,6 +206,21 @@ void updateBatteryEstimate() {
 
   batteryEstDays = remainingFrac * 90.0f;
   batteryLow = batteryEstDays <= BAT_WARN_DAYS;
+}
+
+/** Spannung lesen; NVS nur bei merklicher Änderung oder Mitternacht-Wake. */
+void updateBatteryEstimate(bool persistToNvs) {
+  float volts = readBatteryVoltage();
+  float ema = prefs.getFloat(KEY_VOLT_EMA, volts);
+  float newEma = (ema <= 0.1f) ? volts : (ema * 0.92f + volts * 0.08f);
+  applyBatteryFromEma(newEma);
+
+  float emaDelta = newEma > ema ? newEma - ema : ema - newEma;
+  if (!persistToNvs && emaDelta < BAT_EMA_PERSIST_DELTA) {
+    return;
+  }
+
+  prefs.putFloat(KEY_VOLT_EMA, newEma);
 }
 
 void formatBatteryDaysRemaining(char* out, size_t outLen) {
@@ -607,10 +600,6 @@ void syncRenderedState() {
   lastRenderedBatteryLow = batteryLow;
 }
 
-bool displayNeedsRefresh() {
-  return daysSinceClean != lastRenderedDaysSinceClean || batteryLow != lastRenderedBatteryLow;
-}
-
 void refreshMainScreen(epd_mode_t mode) {
   M5.Display.setEpdMode(mode);
   M5.Display.startWrite();
@@ -620,8 +609,8 @@ void refreshMainScreen(epd_mode_t mode) {
   syncRenderedState();
 }
 
-bool wokeFromDailyTimer() {
-  return esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER;
+bool isTimerWake(esp_sleep_wakeup_cause_t cause) {
+  return cause == ESP_SLEEP_WAKEUP_TIMER;
 }
 
 void applyPreviewDay(int day) {
@@ -653,7 +642,6 @@ void runBatteryPreviewDemo() {
 }
 
 void enterSelectionScreen() {
-  updateBatteryEstimate();
   M5.Display.setEpdMode(epd_mode_t::epd_fastest);
   M5.Display.startWrite();
   M5.Display.fillScreen(TFT_WHITE);
@@ -682,11 +670,14 @@ bool userActive() {
 }
 
 void enableButtonWakeup() {
-  gpio_wakeup_enable(GPIO_NUM_37, GPIO_INTR_LOW_LEVEL);
-  gpio_wakeup_enable(GPIO_NUM_38, GPIO_INTR_LOW_LEVEL);
-  gpio_wakeup_enable(GPIO_NUM_39, GPIO_INTR_LOW_LEVEL);
-  gpio_wakeup_enable(GPIO_NUM_27, GPIO_INTR_LOW_LEVEL);
-  gpio_wakeup_enable(GPIO_NUM_5, GPIO_INTR_LOW_LEVEL);
+  static constexpr gpio_num_t WAKE_PINS[] = {
+    GPIO_NUM_37, GPIO_NUM_38, GPIO_NUM_39, GPIO_NUM_27, GPIO_NUM_5,
+  };
+
+  for (gpio_num_t pin : WAKE_PINS) {
+    gpio_set_pull_mode(pin, GPIO_PULLUP_ONLY);
+    gpio_wakeup_enable(pin, GPIO_INTR_LOW_LEVEL);
+  }
   esp_sleep_enable_gpio_wakeup();
 }
 
@@ -716,6 +707,8 @@ void enterIdleSleep() {
 }
 
 void setup() {
+  esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
+
   auto cfg = M5.config();
   M5.begin(cfg);
 
@@ -728,7 +721,7 @@ void setup() {
   ensureBaselineCleanDate();
   migrateDiagnostics();
   loadState();
-  updateBatteryEstimate();
+  updateBatteryEstimate(isTimerWake(wakeCause));
 
   picker = 0;
 
@@ -739,11 +732,16 @@ void setup() {
 
   if (DEMO_BATTERY_PREVIEW) {
     runBatteryPreviewDemo();
-    updateBatteryEstimate();
+    updateBatteryEstimate(true);
   }
 
   if (!DEMO_DAY_PREVIEW && !DEMO_BATTERY_PREVIEW) {
-    refreshMainScreen(epd_mode_t::epd_fast);
+    // E-Paper hält das Bild im Deep-Sleep — Knopf-Wake braucht keinen Refresh.
+    if (isTimerWake(wakeCause) || wakeCause == ESP_SLEEP_WAKEUP_UNDEFINED) {
+      refreshMainScreen(epd_mode_t::epd_fast);
+    } else {
+      syncRenderedState();
+    }
   }
 
   M5.Speaker.setVolume(0);

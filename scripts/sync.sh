@@ -5,6 +5,8 @@ export PATH="${HOME}/.local/bin:${PATH}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENSURE_PORT="${ROOT}/scripts/ensure_serial_port.sh"
+
+bash "${ENSURE_PORT}" "${COREINK_PORT:-/dev/cu.usbserial-5A6D0127411}" 2>/dev/null || true
 FQBN="m5stack:esp32:m5stack_coreink"
 SKETCH="${ROOT}/firmware/barista_monitor"
 BUILD="${ROOT}/build"
@@ -82,7 +84,8 @@ for attempt in 1 2 3 4 5; do
     echo "Sync fertig (RTC = Lokalzeit beim Build)."
     exit 0
   fi
-  sleep 2
+  echo "Warte 5s auf USB-Reconnect..."
+  sleep 5
 done
 
 echo "Sync fehlgeschlagen." >&2
