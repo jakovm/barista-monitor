@@ -53,6 +53,17 @@ bash scripts/sync.sh /dev/cu.usbserial-5A6D0127411
 
 `flash.sh` und `sync.sh` rufen `ensure_serial_port.sh` vor **jedem** Upload-Versuch automatisch auf.
 
+## Erfolg trotz USB-Abbruch (wichtig)
+
+CoreInk trennt USB oft **nach** erfolgreichem Write (Hard-Reset / Deep-Sleep).  
+esptool/arduino-cli melden dann Exit ≠ 0, obwohl die Firmware schon drauf ist.
+
+`flash.sh` / `sync.sh` werten deshalb als **Erfolg**, wenn:
+- App-Partition geschrieben (`Wrote … at 0x00010000`) und
+- mindestens ein `Hash of data verified`
+
+→ **keine** weiteren Retries nach verifiziertem Write. Chat/Agent nicht minutenlang blockieren lassen.
+
 ## Nach erfolgreichem Flash
 
 Agent-Button wieder starten (Atom Matrix, separater Port):
@@ -77,5 +88,5 @@ Atom-Matrix-Port: `/dev/cu.usbserial-855251E6E2`
 
 1. `ensure_serial_port.sh` ausführen
 2. CoreInk per Knopf kurz wecken, USB prüfen
-3. `flash.sh` erneut starten (bis zu 5 Versuche intern)
+3. `flash.sh` erneut starten (bis zu 5 Versuche intern; bricht bei Hash-ok ab)
 4. Schlägt es wieder fehl → `lsof` + USB-Kabel/Hub prüfen, dann Schritt 1
