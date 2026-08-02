@@ -12,6 +12,9 @@ static constexpr const char* KEY_CLEANER = "cleaner";
 static constexpr const char* KEY_VOLT_EMA = "voltEma";
 static constexpr const char* KEY_DIAG_VERSION = "diagVer";
 static constexpr const char* KEY_RTC_STAMP = "rtcStamp";
+/** Letzter gerenderter Tages-/Akku-Stand (überlebt Deep-Sleep). */
+static constexpr const char* KEY_RENDER_DAYS = "rDays";
+static constexpr const char* KEY_RENDER_BAT = "rBat";
 static constexpr uint8_t DIAG_VERSION = 1;
 
 static constexpr const char* CLEANERS[] = {"Jakov", "Nina", "Guest"};
@@ -29,6 +32,18 @@ static constexpr int BEAN_H = 12;
 static constexpr uint16_t AWAKE_MS = 60000;
 /** Task-WDT: bei hängendem E-Paper-Refresh Neustart statt Dauer-Freeze. */
 static constexpr uint32_t WDT_TIMEOUT_MS = 30000;
+/**
+ * Max. Deep-Sleep-Dauer (Heartbeat). Light-Sleep über viele Stunden friert auf
+ * ESP32/CoreInk erfahrungsgemäß ein — Deep-Sleep + periodisches Aufwachen ist
+ * zuverlässig.
+ *
+ * Sleep = min(Sekunden bis Mitternacht, MAX_SLEEP_SEC).
+ * 10 h reichen: solange Restzeit bis Mitternacht > 10 h → Heartbeat;
+ * sobald Restzeit ≤ 10 h → Timer zielt exakt auf Mitternacht.
+ * Worst case nach verpasstem Wechsel: Display spätestens nach 10 h korrigiert.
+ */
+static constexpr uint32_t MAX_SLEEP_SEC = 10u * 3600u;
+static constexpr uint32_t MIN_SLEEP_SEC = 2;
 static constexpr bool DEMO_DAY_PREVIEW = false;
 static constexpr uint8_t DEMO_DAY_COUNT = 10;
 static constexpr uint16_t DEMO_DAY_MS = 3000;
@@ -39,7 +54,7 @@ static constexpr float BAT_WARN_DAYS = 10.0f;
 static constexpr uint8_t BAT_ALARM_DAYS = 7;
 static constexpr float BAT_FULL_V = 4.10f;
 static constexpr float BAT_EMPTY_V = 3.35f;
-/** Kalenderwechsel per Deep-Sleep-Timer (Lokalzeit Mitternacht). */
+/** Kalenderwechsel (Lokalzeit Mitternacht). */
 static constexpr int DAILY_ROLLOVER_HOUR = 0;
 static constexpr float BAT_EMA_PERSIST_DELTA = 0.02f;
 
@@ -604,6 +619,19 @@ void syncRenderedState() {
   lastRenderedBatteryLow = batteryLow;
 }
 
+/** Ob E-Paper neu gezeichnet werden muss (NVS vs. aktueller Kalender/Akku). */
+bool hasDisplayStateChanged() {
+  int storedDays = prefs.getInt(KEY_RENDER_DAYS, -999);
+  bool storedBat = prefs.getBool(KEY_RENDER_BAT, false);
+  return storedDays != daysSinceClean || storedBat != batteryLow;
+}
+
+void saveDisplayState() {
+  prefs.putInt(KEY_RENDER_DAYS, daysSinceClean);
+  prefs.putBool(KEY_RENDER_BAT, batteryLow);
+  syncRenderedState();
+}
+
 void feedWatchdog() {
   esp_task_wdt_reset();
 }
@@ -615,7 +643,7 @@ void refreshMainScreen(epd_mode_t mode) {
   drawMainScreen();
   commitDisplay();
   screenDirty = false;
-  syncRenderedState();
+  saveDisplayState();
   feedWatchdog();
 }
 
@@ -712,33 +740,17 @@ bool userActive() {
 }
 
 /**
- * Button-Wake für Light-Sleep (alle Tasten inkl. GPIO5).
- * Hinweis: esp_sleep_enable_gpio_wakeup() wirkt nur im Light-Sleep —
- * im Deep-Sleep wäre das ein „Freeze“ (nur Mitternacht weckt).
- */
-void enableButtonWakeupLightSleep() {
-  static constexpr gpio_num_t WAKE_PINS[] = {
-    GPIO_NUM_37, GPIO_NUM_38, GPIO_NUM_39, GPIO_NUM_27, GPIO_NUM_5,
-  };
-
-  for (gpio_num_t pin : WAKE_PINS) {
-    gpio_set_pull_mode(pin, GPIO_PULLUP_ONLY);
-    gpio_wakeup_enable(pin, GPIO_INTR_LOW_LEVEL);
-  }
-  esp_sleep_enable_gpio_wakeup();
-}
-
-/**
- * Button-Wake für Deep-Sleep (ESP32 classic: EXT0 = genau ein RTC-Pin, aktiv low).
- * GPIO37 = BtnA (Dial). Weitere Tasten: Light-Sleep-Pfad oben.
+ * Button-Wake im Deep-Sleep.
+ * ESP32 classic: EXT0 = ein RTC-Pin, aktiv low. (EXT1 kennt hier kein ANY_LOW.)
+ * GPIO37 = BtnA (Dial) — Hauptbedienung. Andere Tasten erst nach dem Wecken.
  */
 void enableButtonWakeupDeepSleep() {
   static constexpr gpio_num_t DEEP_WAKE_PIN = GPIO_NUM_37;
-  gpio_set_pull_mode(DEEP_WAKE_PIN, GPIO_PULLUP_ONLY);
+  // GPIO37 input-only: Board-Pullup, kein interner Pull.
   esp_sleep_enable_ext0_wakeup(DEEP_WAKE_PIN, 0);
 }
 
-/** Sekunden bis Mitternacht (00:00): Zähler hoch, danach Display. */
+/** Sekunden bis zum nächsten geplanten Tages-Wake (Mitternacht / DAILY_ROLLOVER_HOUR). */
 uint32_t secondsUntilNextDailyWake() {
   auto dt = M5.Rtc.getDateTime();
   int secondsNow = dt.time.hours * 3600 + dt.time.minutes * 60 + dt.time.seconds;
@@ -751,15 +763,27 @@ uint32_t secondsUntilNextDailyWake() {
 }
 
 /**
- * Idle-Schlaf ohne E-Paper-Refresh im Sleep-Kontext.
+ * Tatsächliche Sleep-Dauer: Mitternacht wenn nah genug, sonst Heartbeat-Cap (10 h).
+ * Kalendertag wird beim Wake geprüft — ohne tagelangen Light-Sleep (Freeze-Ursache).
+ */
+uint32_t secondsUntilNextWake() {
+  uint32_t toDaily = secondsUntilNextDailyWake();
+  if (toDaily > MAX_SLEEP_SEC) {
+    return MAX_SLEEP_SEC;
+  }
+  if (toDaily < MIN_SLEEP_SEC) {
+    return MIN_SLEEP_SEC;
+  }
+  return toDaily;
+}
+
+/**
+ * Idle: immer Deep-Sleep (voller Neustart beim Wake = sauberer Zustand).
  *
- * Früher: Light-Sleep-Schleife + Display-Refresh nach Timer → E-Paper-Hänger.
- * Danach: reiner Deep-Sleep, aber gpio_wakeup greift dort nicht → Tasten tot.
- *
- * Jetzt:
- * - Light-Sleep mit GPIO-Wake (alle Tasten), kein Display-Refresh hier
- * - Mitternachts-Timer → esp_restart() und frischer setup()-Refresh
- * - Fallback: Deep-Sleep mit EXT0 (BtnA) falls Light-Sleep scheitert
+ * - Timer: Mitternacht oder Heartbeat (MAX_SLEEP_SEC)
+ * - Tasten: EXT0 (Dial / BtnA)
+ * - Kein Light-Sleep über Stunden (hat nach ~Tagen eingefroren)
+ * - Kein E-Paper-Refresh im Sleep-Kontext
  */
 void enterIdleSleep() {
   M5.Display.sleep();
@@ -769,49 +793,13 @@ void enterIdleSleep() {
 
   waitButtonsReleased(2000);
 
-  uint8_t lightSleepFails = 0;
-  while (true) {
-    feedWatchdog();
-    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-    enableButtonWakeupLightSleep();
-    esp_sleep_enable_timer_wakeup((uint64_t)secondsUntilNextDailyWake() * 1000000ULL);
-
-    esp_err_t err = esp_light_sleep_start();
-    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-
-    if (cause == ESP_SLEEP_WAKEUP_TIMER) {
-      // Sauberer Boot vor jedem Mitternachts-E-Paper-Refresh (kein Hang-Kontext).
-      esp_restart();
-    }
-
-    if (isButtonWake(cause)) {
-      M5.Display.wakeup();
-      delay(30);
-      M5.update();
-      int prevDays = lastRenderedDaysSinceClean;
-      bool prevBat = lastRenderedBatteryLow;
-      loadState();
-      updateBatteryEstimate(false);
-      // Tageswechsel ohne Timer (selten): nur per Clean-Boot refreshen.
-      if (daysSinceClean != prevDays || batteryLow != prevBat) {
-        esp_restart();
-      }
-      return;
-    }
-
-    // Unerwarteter Wake / Fehler → nach wenigen Versuchen Deep-Sleep-Fallback (BtnA + Timer).
-    lightSleepFails++;
-    if (err != ESP_OK) {
-      delay(50);
-    }
-    if (lightSleepFails >= 3) {
-      esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-      enableButtonWakeupDeepSleep();
-      esp_sleep_enable_timer_wakeup((uint64_t)secondsUntilNextDailyWake() * 1000000ULL);
-      delay(50);
-      esp_deep_sleep_start();
-    }
-  }
+  feedWatchdog();
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+  enableButtonWakeupDeepSleep();
+  esp_sleep_enable_timer_wakeup((uint64_t)secondsUntilNextWake() * 1000000ULL);
+  delay(30);
+  esp_deep_sleep_start();
+  // kehrt nicht zurück
 }
 
 void setup() {
@@ -831,8 +819,7 @@ void setup() {
   ensureBaselineCleanDate();
   migrateDiagnostics();
   loadState();
-  // Nach esp_restart() aus Timer-Wake ist cause UNDEFINED — EMA trotzdem sichern,
-  // wenn wir den Tag frisch laden (Mitternacht / Kaltstart).
+  // Timer-Heartbeat und Kaltstart: EMA persistieren; reiner Knopf-Wake: nur lesen.
   bool persistBattery = isTimerWake(wakeCause) || wakeCause == ESP_SLEEP_WAKEUP_UNDEFINED;
   updateBatteryEstimate(persistBattery);
 
@@ -849,12 +836,21 @@ void setup() {
   }
 
   if (!DEMO_DAY_PREVIEW && !DEMO_BATTERY_PREVIEW) {
-    // E-Paper hält das Bild — reiner Knopf-Wake (EXT0/GPIO) ohne Refresh.
-    // Timer und Kaltstart/Restart: Display aktualisieren (Tageszähler).
-    if (isTimerWake(wakeCause) || wakeCause == ESP_SLEEP_WAKEUP_UNDEFINED) {
-      refreshMainScreen(epd_mode_t::epd_fast);
+    bool changed = hasDisplayStateChanged();
+
+    if (isButtonWake(wakeCause)) {
+      // E-Paper hält das Bild — nur refreshen, wenn sich Tag/Akku im Sleep geändert hat.
+      if (changed) {
+        refreshMainScreen(epd_mode_t::epd_fast);
+      } else {
+        syncRenderedState();
+      }
+    } else if (isTimerWake(wakeCause) && !changed) {
+      // Stiller Heartbeat: Kalender unverändert → sofort wieder Deep-Sleep.
+      enterIdleSleep();
     } else {
-      syncRenderedState();
+      // Mitternacht / Tageswechsel / Kaltstart: Display aktualisieren.
+      refreshMainScreen(epd_mode_t::epd_fast);
     }
   }
 
