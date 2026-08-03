@@ -29,19 +29,28 @@ static constexpr int DAY_BAND_H = 36;
 static constexpr int DAY_BAR_H = 14;
 static constexpr int BEAN_W = 22;
 static constexpr int BEAN_H = 12;
+/** Nach Nutzer-Interaktion wach bleiben (Menü, Reinigung markieren). */
 static constexpr uint16_t AWAKE_MS = 60000;
+/**
+ * Nach stillem RTC-Wake (gleicher Kalendertag, kein Display-Update):
+ * kurz wach, damit ein Tastendruck noch greift, dann wieder aus.
+ */
+static constexpr uint16_t HEARTBEAT_AWAKE_MS = 8000;
 /** Task-WDT: bei hängendem E-Paper-Refresh Neustart statt Dauer-Freeze. */
 static constexpr uint32_t WDT_TIMEOUT_MS = 30000;
 /**
- * Max. Sleep pro Chunk. Lange Einzel-Sleeps (Stunden/Tage) waren die Freeze-Ursache:
- * Light-Sleep „hängt“ still, Deep-Sleep-Timer weckt auf CoreInk/Akku unzuverlässig.
- * Kurze Chunks: alle Tasten + Timer, Kalender prüfen, neu schlafen.
- * Worst case Display-Update nach Mitternacht: MAX_SLEEP_SEC.
+ * CoreInk-Idle = echter Power-Off + BM8563-Timer (M5.Power.timerSleep).
+ * BM8563 Countdown: max. 255 Minuten → Cap 4 h.
+ * Sleep = min(Sekunden bis Mitternacht, MAX_SLEEP_SEC).
+ *
+ * NICHT ESP light/deep sleep als Hauptpfad:
+ * - Light-Sleep kann hängen (WDT pausiert → tot)
+ * - Deep-Sleep: nur 1 EXT0-Pin; Wahlhebel-Down/Right weckt nicht
+ * - GPIO19 (RTC-INT) ist kein RTC-GPIO → weckt Deep-Sleep nicht (USB/Forum)
+ * Offiziell (M5 Docs): RTC + Power-Hold; Aufwachen per PWR oder RTC.
  */
-static constexpr uint32_t MAX_SLEEP_SEC = 15u * 60u;
-static constexpr uint32_t MIN_SLEEP_SEC = 2;
-/** Nach so vielen Light-Sleep-Fehlern: kurzer Deep-Sleep-Fallback (nur Dial). */
-static constexpr uint8_t LIGHT_SLEEP_FAIL_BEFORE_DEEP = 3;
+static constexpr uint32_t MAX_SLEEP_SEC = 255u * 60u;
+static constexpr uint32_t MIN_SLEEP_SEC = 5;
 static constexpr bool DEMO_DAY_PREVIEW = false;
 static constexpr uint8_t DEMO_DAY_COUNT = 10;
 static constexpr uint16_t DEMO_DAY_MS = 3000;
@@ -69,6 +78,8 @@ float batteryEstDays = 90.0f;
 bool batteryDemoActive = false;
 int lastRenderedDaysSinceClean = -1;
 bool lastRenderedBatteryLow = false;
+/** Effektive Wachzeit bis Power-Off (Normal vs. stiller Heartbeat). */
+uint32_t awakeLimitMs = AWAKE_MS;
 
 struct Ymd {
   int year;
@@ -750,8 +761,17 @@ void updateSelectionPicker(uint8_t previousPicker) {
   commitDisplay();
 }
 
+/**
+ * CoreInk-Wahlhebel (M5 Docs PinMap):
+ *   G37 Dial Up  = BtnA  → Menü: vorheriger Eintrag
+ *   G38 Dial Mid = BtnB  → Menü: bestätigen
+ *   G39 Dial Down= BtnC  → Menü: nächster Eintrag
+ *   G5  UserBtn  = BtnEXT
+ *   G27 PWR      = BtnPWR — einziger manueller Wake aus Power-Off (2 s halten)
+ */
 bool dialClicked() {
-  return M5.BtnA.wasClicked() || M5.BtnB.wasClicked() || M5.BtnC.wasClicked();
+  return M5.BtnA.wasClicked() || M5.BtnB.wasClicked() || M5.BtnC.wasClicked()
+      || M5.BtnEXT.wasClicked();
 }
 
 bool userActive() {
@@ -759,36 +779,7 @@ bool userActive() {
       || M5.BtnPWR.isPressed() || M5.BtnEXT.isPressed();
 }
 
-/**
- * Button-Wake Light-Sleep: alle CoreInk-Tasten (GPIO-Wake, nur Light-Sleep).
- * GPIO5 = BtnEXT ist kein RTC-IO → nur hier, nicht im Deep-Sleep.
- */
-void enableButtonWakeupLightSleep() {
-  static constexpr gpio_num_t WAKE_PINS[] = {
-    GPIO_NUM_37, GPIO_NUM_38, GPIO_NUM_39, GPIO_NUM_27, GPIO_NUM_5,
-  };
-  for (gpio_num_t pin : WAKE_PINS) {
-    gpio_wakeup_enable(pin, GPIO_INTR_LOW_LEVEL);
-  }
-  esp_sleep_enable_gpio_wakeup();
-}
-
-/**
- * Button-Wake Deep-Sleep (Fallback): EXT0 = ein Pin, aktiv low.
- * ESP32 classic hat kein EXT1 ANY_LOW. GPIO37 = Dial (BtnA).
- */
-void enableButtonWakeupDeepSleep() {
-  static constexpr gpio_num_t DEEP_WAKE_PIN = GPIO_NUM_37;
-  // EXT0 verlangt, dass der Pin vor dem Sleep NICHT schon low ist.
-  uint32_t guardStart = millis();
-  while (digitalRead(DEEP_WAKE_PIN) == LOW && (millis() - guardStart) < 2000) {
-    feedWatchdog();
-    delay(10);
-  }
-  esp_sleep_enable_ext0_wakeup(DEEP_WAKE_PIN, 0);
-}
-
-/** Sekunden bis zum nächsten geplanten Tages-Wake (Mitternacht / DAILY_ROLLOVER_HOUR). */
+/** Sekunden bis Mitternacht (Kalender-Rollover). */
 uint32_t secondsUntilNextDailyWake() {
   auto dt = M5.Rtc.getDateTime();
   int secondsNow = dt.time.hours * 3600 + dt.time.minutes * 60 + dt.time.seconds;
@@ -801,99 +792,59 @@ uint32_t secondsUntilNextDailyWake() {
 }
 
 /**
- * Sleep-Chunk: min(Rest bis Mitternacht, MAX_SLEEP_SEC).
- * Nie länger als MAX_SLEEP_SEC am Stück schlafen.
+ * Countdown für BM8563: min(Rest bis Mitternacht, MAX_SLEEP_SEC),
+ * geclampt auf den Chip-Timer (max. 255 min).
  */
 uint32_t secondsUntilNextWake() {
   uint32_t toDaily = secondsUntilNextDailyWake();
-  if (toDaily > MAX_SLEEP_SEC) {
-    return MAX_SLEEP_SEC;
+  uint32_t sec = toDaily;
+  if (sec > MAX_SLEEP_SEC) {
+    sec = MAX_SLEEP_SEC;
   }
-  if (toDaily < MIN_SLEEP_SEC) {
-    return MIN_SLEEP_SEC;
+  if (sec < MIN_SLEEP_SEC) {
+    sec = MIN_SLEEP_SEC;
   }
-  return toDaily;
-}
-
-/** Deep-Sleep-Fallback: kurzer Timer + Dial. Kehrt nicht zurück. */
-void enterDeepSleepFallback() {
-  feedWatchdog();
-  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-  enableButtonWakeupDeepSleep();
-  esp_sleep_enable_timer_wakeup((uint64_t)secondsUntilNextWake() * 1000000ULL);
-  delay(30);
-  esp_deep_sleep_start();
+  return sec;
 }
 
 /**
- * Idle-Schlaf — Freeze-resistente Strategie:
+ * Idle = Power-Off + RTC-Wecker (offizieller CoreInk-Weg).
  *
- * 1) Light-Sleep in kurzen Chunks (≤15 min), alle Tasten wecken
- * 2) Timer-Wake: Kalender prüfen → bei Tageswechsel esp_restart() + frisches E-Paper
- * 3) Button-Wake: zurück in die loop() (interaktiv)
- * 4) Kein M5.Display.sleep() — bistabiles E-Paper hält das Bild; Panel-Sleep war
- *    Mitverursacher von BUSY/„tot“ nach langem Idle
- * 5) Light-Sleep-Fehler → Deep-Sleep-Fallback (kurz, nur Dial)
+ * - E-Paper hält das Bild ohne Strom
+ * - BM8563 weckt durch erneutes Anlegen der Versorgung (nicht GPIO19-Deep-Sleep)
+ * - Manuell wecken: PWR ~2 s halten (Wahlhebel ist im Off tot — Hardware!)
+ * - Kehrt normalerweise nicht zurück
  */
 void enterIdleSleep() {
+  feedWatchdog();
   M5.Power.setLed(0);
   WiFi.mode(WIFI_OFF);
+  WiFi.disconnect(true, true);
   waitButtonsReleased(2000);
 
-  uint8_t lightFails = 0;
-
-  while (true) {
-    feedWatchdog();
-
-    if (!rtcLooksValid()) {
-      // Uhr tot → Sleep-Rechnung und Tageszähler sinnlos; Clean-Boot erzwingen.
-      esp_restart();
-    }
-
-    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-    enableButtonWakeupLightSleep();
-    esp_sleep_enable_timer_wakeup((uint64_t)secondsUntilNextWake() * 1000000ULL);
-
-    esp_err_t err = esp_light_sleep_start();
-    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-    feedWatchdog();
-
-    if (isButtonWake(cause)) {
-      delay(30);
-      M5.update();
-      // Tageswechsel während Idle (Taste vor Timer): sauber neu zeichnen.
-      loadState();
-      updateBatteryEstimate(false);
-      if (hasDisplayStateChanged()) {
-        esp_restart();
-      }
-      return;
-    }
-
-    if (cause == ESP_SLEEP_WAKEUP_TIMER) {
-      loadState();
-      updateBatteryEstimate(false);
-      if (hasDisplayStateChanged()) {
-        // Mitternacht / Tag gewechselt: Clean-Boot, dann setup() refresht E-Paper.
-        esp_restart();
-      }
-      // Unverändert: nächsten Chunk schlafen (kein E-Paper, kein RAM-Reset nötig).
-      lightFails = 0;
-      continue;
-    }
-
-    // Unerwarteter Wake oder Light-Sleep-Fehler.
-    lightFails++;
-    if (err != ESP_OK) {
-      delay(50);
-    }
-    if (lightFails >= LIGHT_SLEEP_FAIL_BEFORE_DEEP) {
-      enterDeepSleepFallback();
-    }
+  if (!rtcLooksValid()) {
+    // Ohne gültige RTC kein sinnvoller Timer — kurzer Soft-Reset, dann erneut.
+    delay(100);
+    esp_restart();
   }
+
+  uint32_t sec = secondsUntilNextWake();
+
+  // Offizielle API: RTC-Countdown + Power-Hold-Abschaltung (Akku).
+  // timerSleep löscht IRQs, setzt BM8563-Timer, schaltet HOLD aus.
+  // USB: Power bleibt oft an → M5 fällt intern auf Light-Sleep/Restart zurück.
+  M5.Power.timerSleep((int)sec);
+
+  // Falls timerSleep zurückkehrt (z. B. USB ohne echten Power-Off):
+  // ESP-Timer + Deep-Sleep als Notnagel, dann sauberer Boot.
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+  esp_sleep_enable_timer_wakeup((uint64_t)sec * 1000000ULL);
+  delay(50);
+  esp_deep_sleep_start();
 }
 
 void setup() {
+  // Nach Power-Off/RTC-Wake ist das ein Kaltstart (cause oft UNDEFINED).
   esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
 
   auto cfg = M5.config();
@@ -903,6 +854,9 @@ void setup() {
   WiFi.disconnect(true, true);
   M5.Power.setLed(0);
 
+  // RTC-IRQ vom Weckvorgang quittieren (sonst Soft-Loops).
+  M5.Rtc.clearIRQ();
+
   setupWatchdog();
 
   prefs.begin(NAMESPACE, false);
@@ -910,11 +864,11 @@ void setup() {
   ensureBaselineCleanDate();
   migrateDiagnostics();
   loadState();
-  // Deep-Sleep-Timer / Kaltstart / Restart nach Tageswechsel: EMA sichern.
-  bool persistBattery = isTimerWake(wakeCause) || wakeCause == ESP_SLEEP_WAKEUP_UNDEFINED;
-  updateBatteryEstimate(persistBattery);
+  // Jeder Kaltstart: EMA sichern (Power-Off verliert RAM).
+  updateBatteryEstimate(true);
 
   picker = 0;
+  awakeLimitMs = AWAKE_MS;
 
   if (DEMO_DAY_PREVIEW) {
     runDayPreviewDemo();
@@ -929,20 +883,25 @@ void setup() {
   if (!DEMO_DAY_PREVIEW && !DEMO_BATTERY_PREVIEW) {
     bool changed = hasDisplayStateChanged();
 
-    if (isButtonWake(wakeCause) && !changed) {
-      // Deep-Sleep-Dial-Wake, Bild noch aktuell — E-Paper hält.
+    if (changed) {
+      // Mitternacht / erster Start / neuer Tag → E-Paper aktualisieren.
+      refreshMainScreen(epd_mode_t::epd_fast);
+      awakeLimitMs = AWAKE_MS;
+    } else {
+      // Gleicher Tag: Bild hält; kein Refresh (E-Ink-Schonung, M5 empfiehlt ≥15 s).
       syncRenderedState();
       screenDirty = false;
-    } else if (isTimerWake(wakeCause) && !changed) {
-      // Deep-Sleep-Heartbeat ohne Änderung → sofort weiter schlafen.
-      enterIdleSleep();
-    } else {
-      // Kaltstart, Tageswechsel, Restart, oder Button mit geändertem Stand.
-      refreshMainScreen(epd_mode_t::epd_fast);
+      // Stiller Heartbeat: kurz wach für Tasten, sonst Power-Off.
+      // PWR-Wake zum Bedienen: ebenfalls kurz, User kann sofort wählen.
+      awakeLimitMs = isButtonWake(wakeCause) ? AWAKE_MS : HEARTBEAT_AWAKE_MS;
     }
   }
 
   M5.Speaker.setVolume(0);
+  // LED kurz: Gerät ist wach und bedienbar (Wahlhebel wirkt nur JETZT).
+  M5.Power.setLed(128);
+  delay(80);
+  M5.Power.setLed(0);
   feedWatchdog();
 }
 
@@ -954,6 +913,8 @@ void loop() {
 
   if (userActive()) {
     awakeStart = millis();
+    // Sobald der Nutzer interagiert: volle Wachzeit, nicht nur Heartbeat-Fenster.
+    awakeLimitMs = AWAKE_MS;
   }
 
   bool enteredSelection = false;
@@ -965,6 +926,7 @@ void loop() {
   }
 
   if (selecting && !enteredSelection) {
+    // Dial Up = vorherige Zeile, Dial Down = nächste, Mid = OK
     if (M5.BtnA.wasClicked()) {
       uint8_t previousPicker = picker;
       picker = (picker + SELECTION_ITEM_COUNT - 1) % SELECTION_ITEM_COUNT;
@@ -991,16 +953,16 @@ void loop() {
     refreshMainScreen(epd_mode_t::epd_fastest);
   }
 
-  // Auch im Auswahlmenü nach Idle schlafen — sonst „hängend“ wach bis Akku leer.
-  if ((millis() - awakeStart) >= AWAKE_MS) {
+  if ((millis() - awakeStart) >= awakeLimitMs) {
     if (selecting) {
       selecting = false;
       screenDirty = true;
       refreshMainScreen(epd_mode_t::epd_fastest);
     }
     enterIdleSleep();
-    // Light-Sleep-Rückkehr (Taste): Idle-Timer neu, Gerät bedienbar.
+    // Nur erreichbar, wenn Power-Off fehlschlug (z. B. USB): neu wach.
     awakeStart = millis();
+    awakeLimitMs = AWAKE_MS;
   }
 
   delay(selecting ? 1 : 20);
