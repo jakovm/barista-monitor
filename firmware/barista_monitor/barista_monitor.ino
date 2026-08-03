@@ -881,19 +881,18 @@ void setup() {
   }
 
   if (!DEMO_DAY_PREVIEW && !DEMO_BATTERY_PREVIEW) {
+    // IMMER neu zeichnen nach M5.begin / Power-On / Flash.
+    // Skip bei "gleicher Tag" ließ das Panel weiß (init/flash löscht den
+    // Framebuffer; E-Ink hält nur, wenn wir gar nicht re-initen — tun wir aber).
     bool changed = hasDisplayStateChanged();
-
-    if (changed) {
-      // Mitternacht / erster Start / neuer Tag → E-Paper aktualisieren.
-      refreshMainScreen(epd_mode_t::epd_fast);
+    refreshMainScreen(epd_mode_t::epd_quality);
+    // Voller Wachfenster bei Tageswechsel oder manuellem Wake; Heartbeat kürzer.
+    awakeLimitMs = (changed || isButtonWake(wakeCause) || wakeCause == ESP_SLEEP_WAKEUP_UNDEFINED)
+        ? (uint32_t)AWAKE_MS
+        : (uint32_t)HEARTBEAT_AWAKE_MS;
+    // Kaltstart nach Flash/PWR ist UNDEFINED → volle Wachzeit (Menü bedienbar).
+    if (wakeCause == ESP_SLEEP_WAKEUP_UNDEFINED) {
       awakeLimitMs = AWAKE_MS;
-    } else {
-      // Gleicher Tag: Bild hält; kein Refresh (E-Ink-Schonung, M5 empfiehlt ≥15 s).
-      syncRenderedState();
-      screenDirty = false;
-      // Stiller Heartbeat: kurz wach für Tasten, sonst Power-Off.
-      // PWR-Wake zum Bedienen: ebenfalls kurz, User kann sofort wählen.
-      awakeLimitMs = isButtonWake(wakeCause) ? AWAKE_MS : HEARTBEAT_AWAKE_MS;
     }
   }
 
