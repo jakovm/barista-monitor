@@ -1,6 +1,5 @@
 #include <M5Unified.h>
 #include <Preferences.h>
-#include <WiFi.h>
 #include <esp_adc_cal.h>
 #include <esp_sleep.h>
 #include <esp_task_wdt.h>
@@ -15,7 +14,11 @@ static constexpr const char* KEY_RTC_STAMP = "rtcStamp";
 /** Letzter gerenderter Tages-/Akku-Stand (überlebt Deep-Sleep). */
 static constexpr const char* KEY_RENDER_DAYS = "rDays";
 static constexpr const char* KEY_RENDER_BAT = "rBat";
-static constexpr uint8_t DIAG_VERSION = 1;
+/** Ringpuffer mit Boot-Diagnosen — nach einem Freeze am Gerät auslesbar. */
+static constexpr const char* KEY_DIAG_LOG = "diagLog";
+static constexpr const char* KEY_DIAG_HEAD = "diagHead";
+static constexpr uint8_t DIAG_VERSION = 2;
+static constexpr uint8_t DIAG_SLOTS = 8;
 
 static constexpr const char* CLEANERS[] = {"Jakov", "Nina", "Guest"};
 static constexpr uint8_t CLEANER_COUNT = 3;
@@ -36,21 +39,48 @@ static constexpr uint16_t AWAKE_MS = 60000;
  * kurz wach, damit ein Tastendruck noch greift, dann wieder aus.
  */
 static constexpr uint16_t HEARTBEAT_AWAKE_MS = 8000;
+/**
+ * Harte Obergrenze für ein Wachfenster. Ohne die hält ein klemmender oder
+ * floatender Tasten-GPIO das Gerät über userActive() dauerhaft wach, bis der
+ * Akku leer ist — von außen nicht von einem Freeze zu unterscheiden.
+ */
+static constexpr uint32_t MAX_AWAKE_MS = 180000;
 /** Task-WDT: bei hängendem E-Paper-Refresh Neustart statt Dauer-Freeze. */
 static constexpr uint32_t WDT_TIMEOUT_MS = 30000;
 /**
- * CoreInk-Idle = echter Power-Off + BM8563-Timer (M5.Power.timerSleep).
- * BM8563 Countdown: max. 255 Minuten → Cap 4 h.
- * Sleep = min(Sekunden bis Mitternacht, MAX_SLEEP_SEC).
+ * CoreInk-Idle = Power-Hold trennen + BM8563-Timer, aber selbst gebaut.
+ * M5.Power.timerSleep() ist dafür unbrauchbar:
+ * - _powerOff() pulst POWER_HOLD 5x LOW/HIGH und endet HIGH; auf dem
+ *   latch-basierten CoreInk muss der Pin einmal LOW und LOW bleiben.
+ * - esp_sleep_enable_ext0_wakeup(GPIO19) schlägt fehl (kein RTC-GPIO),
+ *   deshalb landet die Bibliothek in esp_light_sleep_start() statt Deep-Sleep.
+ * - Der I2C-Write des Timers wird nirgends verifiziert.
  *
- * NICHT ESP light/deep sleep als Hauptpfad:
- * - Light-Sleep kann hängen (WDT pausiert → tot)
- * - Deep-Sleep: nur 1 EXT0-Pin; Wahlhebel-Down/Right weckt nicht
- * - GPIO19 (RTC-INT) ist kein RTC-GPIO → weckt Deep-Sleep nicht (USB/Forum)
- * Offiziell (M5 Docs): RTC + Power-Hold; Aufwachen per PWR oder RTC.
+ * BM8563 Countdown: max. 255 Minuten → Cap 4 h 15 min.
  */
 static constexpr uint32_t MAX_SLEEP_SEC = 255u * 60u;
 static constexpr uint32_t MIN_SLEEP_SEC = 5;
+/** Ersatztakt, wenn die RTC nicht verlässlich wecken kann. */
+static constexpr uint32_t RTC_FALLBACK_SLEEP_SEC = 3600;
+/** Häppchengröße der Rückfallebene. Kurz genug, um die RTC oft neu zu prüfen. */
+static constexpr uint32_t SLEEP_CHUNK_SEC = 60;
+/** BM8563 (PCF8563-kompatibel) am internen I2C-Bus. */
+static constexpr uint8_t RTC_ADDR = 0x51;
+static constexpr uint32_t RTC_FREQ = 400000;
+static constexpr uint8_t RTC_REG_STATUS2 = 0x01;
+static constexpr uint8_t RTC_REG_SECONDS = 0x02;
+static constexpr uint8_t RTC_REG_TIMER_CTL = 0x0E;
+static constexpr uint8_t RTC_REG_TIMER_CNT = 0x0F;
+/** CoreInk POWER_HOLD: LOW trennt die Versorgung. */
+static constexpr uint8_t POWER_HOLD_PIN = 12;
+/** E-Paper BUSY (GDEW0154 auf CoreInk): LOW = Panel arbeitet noch. */
+static constexpr uint8_t EPD_BUSY_PIN = 4;
+/** waitDisplay() gibt nach 1 s auf; ein Full-Refresh dauert länger. */
+static constexpr uint32_t EPD_BUSY_TIMEOUT_MS = 8000;
+/** PWR-Taste. Einziger RTC-fähiger Wake-Pin am CoreInk (GPIO5/19 sind es nicht). */
+static constexpr gpio_num_t PWR_BTN_PIN = GPIO_NUM_27;
+/** Diagnose-Screen: Wahlhebel-Mitte so lange halten. */
+static constexpr uint32_t DIAG_HOLD_MS = 2000;
 static constexpr bool DEMO_DAY_PREVIEW = false;
 static constexpr uint8_t DEMO_DAY_COUNT = 10;
 static constexpr uint16_t DEMO_DAY_MS = 3000;
@@ -80,6 +110,34 @@ int lastRenderedDaysSinceClean = -1;
 bool lastRenderedBatteryLow = false;
 /** Effektive Wachzeit bis Power-Off (Normal vs. stiller Heartbeat). */
 uint32_t awakeLimitMs = AWAKE_MS;
+bool showingDiag = false;
+bool rtcUsable = false;
+
+/**
+ * Ein Boot-Eintrag. Bewusst klein und gepackt, damit acht Stück als ein
+ * NVS-Blob durchgehen und der Freeze-Grund nach dem Freeze noch da ist.
+ */
+struct __attribute__((packed)) BootRecord {
+  uint32_t ymd;        // 0 = RTC beim Boot nicht lesbar
+  uint16_t hm;         // hhmm
+  uint16_t voltMv;
+  uint16_t sleepSec10; // geplante Sleep-Dauer / 10
+  uint8_t resetReason;
+  uint8_t wakeCause;
+  uint8_t flags;
+  uint8_t seq;
+};
+
+static constexpr uint8_t DIAG_F_RTC_READ = 0x01;   // I2C-Read hat funktioniert
+static constexpr uint8_t DIAG_F_RTC_PLAUS = 0x02;  // Datum/Uhrzeit plausibel
+static constexpr uint8_t DIAG_F_RTC_VLOW = 0x04;   // VL-Bit: Uhr war stromlos
+static constexpr uint8_t DIAG_F_RTC_RESET = 0x08;  // aus Build-Stamp gesetzt
+static constexpr uint8_t DIAG_F_TIMER_OK = 0x10;   // Weckzeit zurückgelesen, steht
+static constexpr uint8_t DIAG_F_PWROFF_FAIL = 0x20;// Power-Hold hat nicht getrennt
+static constexpr uint8_t DIAG_F_CHUNKED = 0x40;    // Rückfallebene Light-Sleep-Häppchen
+
+BootRecord diagLog[DIAG_SLOTS];
+uint8_t diagHead = 0;
 
 struct Ymd {
   int year;
@@ -87,7 +145,17 @@ struct Ymd {
   int day;
 };
 
+/**
+ * 0 = ungültig. Ohne diese Prüfung wird aus einem fehlgeschlagenen RTC-Read
+ * (day = -1) über den uint32-Cast der Schlüssel 20000099, und der landet
+ * dauerhaft in NVS — Tageszähler danach im Tausenderbereich.
+ */
 uint32_t ymdToKey(const Ymd& ymd) {
+  if (ymd.year < 1970 || ymd.year > 2099
+   || ymd.month < 1 || ymd.month > 12
+   || ymd.day < 1 || ymd.day > 31) {
+    return 0;
+  }
   return (uint32_t)ymd.year * 10000u + (uint32_t)ymd.month * 100u + (uint32_t)ymd.day;
 }
 
@@ -99,17 +167,52 @@ Ymd keyToYmd(uint32_t key) {
   };
 }
 
-/** Kalendertag laut RTC (Wechsel um Mitternacht). */
-Ymd calendarToday() {
-  auto dt = M5.Rtc.getDateTime();
-  return {dt.date.year, dt.date.month, dt.date.date};
+/**
+ * Bei I2C-Fehler liefert M5.Rtc.getDateTime() die default-konstruierte
+ * Struktur (year 2000, date/hours -1) zurück, ohne das anzuzeigen. Deshalb
+ * überall den bool-Rückgabewert auswerten statt der Struktur zu vertrauen.
+ */
+bool readRtc(m5::rtc_datetime_t* out) {
+  return M5.Rtc.getDateTime(out);
+}
+
+bool rtcPlausible(const m5::rtc_datetime_t& dt) {
+  return dt.date.year >= 2024 && dt.date.year <= 2036
+      && dt.date.month >= 1 && dt.date.month <= 12
+      && dt.date.date >= 1 && dt.date.date <= 31
+      && dt.time.hours >= 0 && dt.time.hours <= 23
+      && dt.time.minutes >= 0 && dt.time.minutes <= 59
+      && dt.time.seconds >= 0 && dt.time.seconds <= 59;
+}
+
+/** Kalendertag laut RTC. false = nicht lesbar/unplausibel → nichts speichern. */
+bool calendarToday(Ymd* out) {
+  m5::rtc_datetime_t dt;
+  if (!readRtc(&dt) || !rtcPlausible(dt)) {
+    return false;
+  }
+  *out = {dt.date.year, dt.date.month, dt.date.date};
+  return true;
 }
 
 void formatRtcDateTime(char* out, size_t outLen) {
-  auto dt = M5.Rtc.getDateTime();
+  m5::rtc_datetime_t dt;
+  if (!readRtc(&dt)) {
+    snprintf(out, outLen, "RTC ?");
+    return;
+  }
   snprintf(out, outLen, "%02d.%02d.%04d %02d:%02d",
            dt.date.date, dt.date.month, dt.date.year,
            dt.time.hours, dt.time.minutes);
+}
+
+/** VL-Bit (Reg 0x02 Bit 7): Uhr war stromlos, Zeit und Countdown unbrauchbar. */
+bool rtcVoltLow() {
+  uint8_t v = 0;
+  if (!M5.In_I2C.readRegister(RTC_ADDR, RTC_REG_SECONDS, &v, 1, RTC_FREQ)) {
+    return true;
+  }
+  return (v & 0x80) != 0;
 }
 
 int daysBetween(Ymd from, Ymd to) {
@@ -149,31 +252,20 @@ uint32_t buildStampKey() {
 
 /** Plausibilität: tote/ungültige RTC → falsche Sleep-Dauer und stehender Tageszähler. */
 bool rtcLooksValid() {
-  auto dt = M5.Rtc.getDateTime();
-  if (dt.date.year < 2024 || dt.date.year > 2036) {
-    return false;
-  }
-  if (dt.date.month < 1 || dt.date.month > 12) {
-    return false;
-  }
-  if (dt.date.date < 1 || dt.date.date > 31) {
-    return false;
-  }
-  if (dt.time.hours > 23 || dt.time.minutes > 59 || dt.time.seconds > 59) {
-    return false;
-  }
-  return true;
+  m5::rtc_datetime_t dt;
+  return readRtc(&dt) && rtcPlausible(dt);
 }
 
 /**
  * RTC setzen bei neuem Flash (rtc_stamp.h) oder wenn die RTC unplausibel ist.
  * Nicht bei jedem normalen Reboot überschreiben (Uhr soll weiterlaufen).
  */
-void ensureRtcFromBuildStamp() {
+bool ensureRtcFromBuildStamp() {
   uint32_t stampKey = buildStampKey();
   bool stampOk = prefs.getUInt(KEY_RTC_STAMP, 0u) == stampKey;
-  if (stampOk && rtcLooksValid()) {
-    return;
+  // VL-Bit mitprüfen: nach Tiefentladung ist die Uhr zwar lesbar, aber falsch.
+  if (stampOk && rtcLooksValid() && !rtcVoltLow()) {
+    return false;
   }
   applyRtcDateTime(
     RTC_STAMP_YEAR,
@@ -184,6 +276,7 @@ void ensureRtcFromBuildStamp() {
     RTC_STAMP_SEC
   );
   prefs.putUInt(KEY_RTC_STAMP, stampKey);
+  return true;
 }
 
 /** Erster Lauf: Starttag persistieren, damit Tage ab Flash/Reboot mitzählen. */
@@ -191,34 +284,61 @@ void ensureBaselineCleanDate() {
   if (prefs.isKey(KEY_LAST_DATE)) {
     return;
   }
-  prefs.putUInt(KEY_LAST_DATE, ymdToKey(calendarToday()));
+  Ymd today;
+  if (!calendarToday(&today)) {
+    return;
+  }
+  uint32_t key = ymdToKey(today);
+  if (key != 0) {
+    prefs.putUInt(KEY_LAST_DATE, key);
+  }
 }
 
 void loadState() {
-  uint32_t today = ymdToKey(calendarToday());
-  lastCleanYmd = prefs.getUInt(KEY_LAST_DATE, today);
   lastCleaner = prefs.getUChar(KEY_CLEANER, 0);
   if (lastCleaner >= CLEANER_COUNT) {
     lastCleaner = 0;
   }
 
-  daysSinceClean = daysBetween(keyToYmd(lastCleanYmd), keyToYmd(today));
+  Ymd todayYmd;
+  rtcUsable = calendarToday(&todayYmd);
+  uint32_t today = rtcUsable ? ymdToKey(todayYmd) : 0;
+  lastCleanYmd = prefs.getUInt(KEY_LAST_DATE, today);
+
+  if (today == 0 || lastCleanYmd == 0) {
+    // Ohne verlässliches Datum lieber den zuletzt gezeichneten Stand halten,
+    // als aus Müllwerten einen dreistelligen Tageszähler zu rechnen.
+    daysSinceClean = prefs.getInt(KEY_RENDER_DAYS, 0);
+  } else {
+    daysSinceClean = daysBetween(keyToYmd(lastCleanYmd), keyToYmd(today));
+  }
+
   if (daysSinceClean < 0) {
     daysSinceClean = 0;
+  }
+  if (daysSinceClean > 999) {
+    daysSinceClean = 999;
   }
 
   inverted = daysSinceClean > CLEAN_DAYS_INVERT;
 }
 
-void saveCleaning(uint8_t cleanerIndex) {
-  Ymd today = calendarToday();
-  lastCleanYmd = ymdToKey(today);
+bool saveCleaning(uint8_t cleanerIndex) {
+  Ymd today;
+  uint32_t key = calendarToday(&today) ? ymdToKey(today) : 0;
+  if (key == 0) {
+    // Ohne gültiges Datum nichts schreiben — ein kaputter Schlüssel in NVS
+    // ist ohne Flash-Erase nicht mehr loszuwerden.
+    return false;
+  }
+  lastCleanYmd = key;
   lastCleaner = cleanerIndex % CLEANER_COUNT;
   prefs.putUInt(KEY_LAST_DATE, lastCleanYmd);
   prefs.putUChar(KEY_CLEANER, lastCleaner);
   daysSinceClean = 0;
   inverted = false;
   screenDirty = true;
+  return true;
 }
 
 float readBatteryVoltage() {
@@ -234,13 +354,89 @@ float readBatteryVoltage() {
 }
 
 void migrateDiagnostics() {
-  if (prefs.getUChar(KEY_DIAG_VERSION, 0) >= DIAG_VERSION) {
+  uint8_t version = prefs.getUChar(KEY_DIAG_VERSION, 0);
+  if (version >= DIAG_VERSION) {
     return;
   }
 
-  prefs.remove("boots");
-  prefs.remove(KEY_VOLT_EMA);
+  if (version < 1) {
+    prefs.remove("boots");
+    prefs.remove(KEY_VOLT_EMA);
+  }
+  // Ab Version 2 wird der Diagnose-Ringpuffer bewusst NIE gelöscht — er ist
+  // die einzige Spur, die einen Freeze überlebt.
   prefs.putUChar(KEY_DIAG_VERSION, DIAG_VERSION);
+}
+
+/* --------------------------------------------------------------------------
+ * Diagnose-Ringpuffer
+ *
+ * Ein Eintrag pro Boot in NVS. Zweimal geschrieben: einmal beim Start mit dem,
+ * was dann bekannt ist, und einmal direkt vor dem Abschalten mit Sleep-Dauer
+ * und Ergebnis. Bleibt das zweite Update aus, ist der Eintrag genau die Spur,
+ * die zeigt, dass das Gerät den Sleep-Pfad nie erreicht hat.
+ * ------------------------------------------------------------------------ */
+
+void diagLoad() {
+  size_t len = prefs.getBytes(KEY_DIAG_LOG, diagLog, sizeof(diagLog));
+  if (len != sizeof(diagLog)) {
+    memset(diagLog, 0, sizeof(diagLog));
+  }
+  diagHead = prefs.getUChar(KEY_DIAG_HEAD, 0) % DIAG_SLOTS;
+}
+
+BootRecord& diagCurrent() {
+  return diagLog[diagHead];
+}
+
+/**
+ * Endete der vorige Boot in einem verifizierten Power-Off, ist dieser Start
+ * ein geplanter RTC-Wake.
+ *
+ * esp_sleep_get_wakeup_cause() taugt dafür nicht: nach echtem Power-Off ist
+ * jeder Start ein Kaltstart und meldet UNDEFINED — genau deshalb lief bisher
+ * jeder Weckvorgang die vollen 60 s statt des Heartbeat-Fensters.
+ */
+bool previousBootPoweredOff() {
+  const BootRecord& prev = diagLog[(diagHead + DIAG_SLOTS - 1) % DIAG_SLOTS];
+  return (prev.flags & DIAG_F_TIMER_OK) != 0
+      && (prev.flags & DIAG_F_PWROFF_FAIL) == 0;
+}
+
+void diagFlush() {
+  prefs.putBytes(KEY_DIAG_LOG, diagLog, sizeof(diagLog));
+  prefs.putUChar(KEY_DIAG_HEAD, diagHead);
+}
+
+void diagBeginBoot(esp_sleep_wakeup_cause_t wakeCause) {
+  uint8_t prevSeq = diagLog[diagHead].seq;
+  diagHead = (diagHead + 1) % DIAG_SLOTS;
+
+  BootRecord& r = diagCurrent();
+  memset(&r, 0, sizeof(r));
+  r.seq = prevSeq + 1;
+  r.resetReason = (uint8_t)esp_reset_reason();
+  r.wakeCause = (uint8_t)wakeCause;
+
+  m5::rtc_datetime_t dt;
+  if (readRtc(&dt)) {
+    r.flags |= DIAG_F_RTC_READ;
+    if (rtcPlausible(dt)) {
+      r.flags |= DIAG_F_RTC_PLAUS;
+      r.ymd = ymdToKey({dt.date.year, dt.date.month, dt.date.date});
+      r.hm = (uint16_t)(dt.time.hours * 100 + dt.time.minutes);
+    }
+  }
+  if (rtcVoltLow()) {
+    r.flags |= DIAG_F_RTC_VLOW;
+  }
+  r.voltMv = (uint16_t)(readBatteryVoltage() * 1000.0f);
+
+  diagFlush();
+
+  Serial.printf("[boot] seq=%u reset=%u wake=%u rtc=%08lu %04u volt=%umV flags=0x%02X\n",
+                r.seq, r.resetReason, r.wakeCause,
+                (unsigned long)r.ymd, r.hm, r.voltMv, r.flags);
 }
 
 void applyBatteryFromEma(float ema) {
@@ -575,6 +771,32 @@ void drawDayIndicatorLabel() {
   M5.Display.drawString(daysText, SCREEN_W / 2, BAND_Y + DAY_BAND_H / 2);
 }
 
+/** Letzte Boots am Gerät ablesbar machen — ohne USB, nach dem Freeze. */
+void drawDiagScreen() {
+  M5.Display.setEpdMode(epd_mode_t::epd_fastest);
+  M5.Display.startWrite();
+  M5.Display.fillScreen(TFT_WHITE);
+  M5.Display.setTextFont(&fonts::AsciiFont8x16);
+  M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextDatum(top_left);
+
+  M5.Display.drawString("seq rst wk time  mV  fl", 2, 2);
+
+  for (uint8_t i = 0; i < DIAG_SLOTS; i++) {
+    // Neuester zuerst.
+    const BootRecord& r = diagLog[(diagHead + DIAG_SLOTS - i) % DIAG_SLOTS];
+    char line[40];
+    snprintf(line, sizeof(line), "%3u %3u %2u %04u %4u %02X",
+             r.seq, r.resetReason, r.wakeCause, r.hm, r.voltMv, r.flags);
+    M5.Display.drawString(line, 2, 20 + i * 18);
+  }
+
+  M5.Display.drawString("1=rd 2=ok 4=vl 8=set", 2, 168);
+  M5.Display.drawString("10=tmr 20=pof 40=dsl", 2, 184);
+  commitDisplay();
+}
+
 void drawMainScreen() {
   drawBackground();
 
@@ -640,9 +862,29 @@ void drawSelectionDateTime() {
   M5.Display.drawString(daysText, SCREEN_W - FOOTER_PAD_X, SELECTION_DATETIME_Y);
 }
 
+/**
+ * M5GFX' waitDisplay() gibt nach 1 s auf (_wait_busy Default-Timeout), ein
+ * Full-Refresh des GDEW0154 braucht mehr. Danach in ein schlafendes Panel zu
+ * schreiben oder den Strom zu kappen hinterlässt halbe Bilder — die dann als
+ * "eingefroren" stehenbleiben.
+ */
+void waitPanelIdle(uint32_t timeoutMs) {
+  delay(50);  // BUSY geht erst nach dem Latch des Refresh-Kommandos auf LOW
+  uint32_t start = millis();
+  while ((millis() - start) < timeoutMs) {
+    if (digitalRead(EPD_BUSY_PIN) == HIGH) {
+      return;
+    }
+    feedWatchdog();
+    delay(10);
+  }
+  Serial.printf("[epd] BUSY nach %ums noch aktiv\n", (unsigned)timeoutMs);
+}
+
 void commitDisplay() {
   M5.Display.endWrite();
   M5.Display.waitDisplay();
+  waitPanelIdle(EPD_BUSY_TIMEOUT_MS);
 }
 
 void syncRenderedState() {
@@ -808,39 +1050,126 @@ uint32_t secondsUntilNextWake() {
 }
 
 /**
- * Idle = Power-Off + RTC-Wecker (offizieller CoreInk-Weg).
+ * BM8563-Countdown stellen und per Register-Rücklesen verifizieren.
+ *
+ * Ohne diese Prüfung ist der Power-Off eine Wette: greift der I2C-Write nicht,
+ * schaltet sich das Gerät ab und nichts weckt es je wieder — bis jemand PWR
+ * zwei Sekunden hält. Genau das sieht von außen wie ein Freeze aus.
+ */
+bool armRtcWakeTimer(uint32_t sec) {
+  M5.Rtc.disableIRQ();
+  M5.Rtc.clearIRQ();
+
+  int applied = M5.Rtc.setAlarmIRQ((int)sec);
+  if (applied <= 0) {
+    Serial.printf("[rtc] setAlarmIRQ(%u) -> %d\n", (unsigned)sec, applied);
+    return false;
+  }
+
+  uint8_t ctl = 0;
+  uint8_t cnt = 0;
+  uint8_t st2 = 0;
+  bool read = M5.In_I2C.readRegister(RTC_ADDR, RTC_REG_TIMER_CTL, &ctl, 1, RTC_FREQ)
+           && M5.In_I2C.readRegister(RTC_ADDR, RTC_REG_TIMER_CNT, &cnt, 1, RTC_FREQ)
+           && M5.In_I2C.readRegister(RTC_ADDR, RTC_REG_STATUS2, &st2, 1, RTC_FREQ);
+
+  // 0x0E Bit7 = Timer läuft, 0x0F = Countdown-Wert, 0x01 Bit0 = TIE.
+  bool armed = read && (ctl & 0x80) != 0 && cnt > 0 && (st2 & 0x01) != 0;
+  Serial.printf("[rtc] sec=%u applied=%d ctl=0x%02X cnt=%u st2=0x%02X -> %s\n",
+                (unsigned)sec, applied, ctl, cnt, st2, armed ? "armed" : "FEHLER");
+  return armed;
+}
+
+/**
+ * Rückfallebene, wenn der Power-Off nicht greift oder der RTC-Wecker nicht
+ * verifiziert werden konnte.
+ *
+ * Bewusst KEIN esp_deep_sleep_start(): im Deep-Sleep gibt der ESP32 GPIO12
+ * (POWER_HOLD) frei, der CoreInk verliert die Versorgung — und ohne armierten
+ * BM8563-Timer weckt danach nichts mehr. Genau so wird aus einem Sleep ein
+ * dauerhafter Brick. Stattdessen Light-Sleep in Häppchen: POWER_HOLD bleibt
+ * getrieben, zwischendurch wird der WDT bedient und geprüft, ob die RTC
+ * zurück ist.
+ */
+void fallbackChunkedSleep(uint32_t totalSec) {
+  // Über die Sleep-Dauer läuft der Task-WDT weiter und schlägt beim Aufwachen
+  // sofort zu — für die Dauer der Häppchen abmelden.
+  esp_task_wdt_delete(NULL);
+
+  uint32_t slept = 0;
+  while (slept < totalSec) {
+    uint32_t chunk = totalSec - slept;
+    if (chunk > SLEEP_CHUNK_SEC) {
+      chunk = SLEEP_CHUNK_SEC;
+    }
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    esp_sleep_enable_timer_wakeup((uint64_t)chunk * 1000000ULL);
+    // PWR bleibt bedienbar, damit das Gerät im Notbetrieb nicht tot wirkt.
+    esp_sleep_enable_ext0_wakeup(PWR_BTN_PIN, 0);
+    esp_light_sleep_start();
+    slept += chunk;
+
+    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER) {
+      break;  // Tastendruck
+    }
+    if (rtcLooksValid() && !rtcVoltLow()) {
+      break;  // RTC ist zurück — nächster Durchgang kann wieder abschalten
+    }
+  }
+
+  esp_task_wdt_add(NULL);
+  feedWatchdog();
+  Serial.printf("[sleep] Häppchen-Sleep beendet nach %us\n", (unsigned)slept);
+}
+
+/**
+ * Idle = Versorgung trennen, BM8563 weckt durch erneutes Anlegen.
  *
  * - E-Paper hält das Bild ohne Strom
- * - BM8563 weckt durch erneutes Anlegen der Versorgung (nicht GPIO19-Deep-Sleep)
  * - Manuell wecken: PWR ~2 s halten (Wahlhebel ist im Off tot — Hardware!)
- * - Kehrt normalerweise nicht zurück
+ * - Kehrt nur zurück, wenn der Power-Hold nicht getrennt hat (z. B. am USB)
  */
 void enterIdleSleep() {
   feedWatchdog();
   M5.Power.setLed(0);
-  WiFi.mode(WIFI_OFF);
-  WiFi.disconnect(true, true);
   waitButtonsReleased(2000);
 
-  if (!rtcLooksValid()) {
-    // Ohne gültige RTC kein sinnvoller Timer — kurzer Soft-Reset, dann erneut.
-    delay(100);
-    esp_restart();
+  bool rtcOk = rtcLooksValid() && !rtcVoltLow();
+  uint32_t sec = rtcOk ? secondsUntilNextWake() : RTC_FALLBACK_SLEEP_SEC;
+  bool armed = rtcOk && armRtcWakeTimer(sec);
+
+  BootRecord& r = diagCurrent();
+  r.sleepSec10 = (uint16_t)(sec / 10);
+  if (armed) {
+    r.flags |= DIAG_F_TIMER_OK;
+  }
+  diagFlush();
+
+  waitPanelIdle(EPD_BUSY_TIMEOUT_MS);
+  M5.Display.sleep();
+  delay(50);
+  Serial.flush();
+
+  if (armed) {
+    // Einmal LOW und LOW lassen. M5.Power.timerSleep() pulst hier fünfmal
+    // LOW/HIGH und endet HIGH — auf dem latch-basierten CoreInk bleibt das
+    // Gerät dann an und landet in einem stundenlangen Light-Sleep.
+    pinMode(POWER_HOLD_PIN, OUTPUT);
+    digitalWrite(POWER_HOLD_PIN, LOW);
+    delay(500);
   }
 
-  uint32_t sec = secondsUntilNextWake();
+  // Hier nur, wenn die Versorgung nicht wegging oder der Timer nicht steht.
+  if (armed) {
+    r.flags |= DIAG_F_PWROFF_FAIL;
+  }
+  r.flags |= DIAG_F_CHUNKED;
+  diagFlush();
+  Serial.printf("[sleep] kein Power-Off (armed=%d) — Häppchen-Sleep %us\n",
+                armed ? 1 : 0, (unsigned)sec);
+  Serial.flush();
 
-  // Offizielle API: RTC-Countdown + Power-Hold-Abschaltung (Akku).
-  // timerSleep löscht IRQs, setzt BM8563-Timer, schaltet HOLD aus.
-  // USB: Power bleibt oft an → M5 fällt intern auf Light-Sleep/Restart zurück.
-  M5.Power.timerSleep((int)sec);
-
-  // Falls timerSleep zurückkehrt (z. B. USB ohne echten Power-Off):
-  // ESP-Timer + Deep-Sleep als Notnagel, dann sauberer Boot.
-  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-  esp_sleep_enable_timer_wakeup((uint64_t)sec * 1000000ULL);
-  delay(50);
-  esp_deep_sleep_start();
+  fallbackChunkedSleep(sec);
 }
 
 void setup() {
@@ -848,10 +1177,21 @@ void setup() {
   esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
 
   auto cfg = M5.config();
+  // Ohne Log war jeder bisherige Freeze-Fix ein Blindschuss.
+  cfg.serial_baudrate = 115200;
+  // Wir zeichnen ohnehin immer komplett neu — der Clear spart einen Full-Refresh.
+  cfg.clear_display = false;
+  // Nichts davon wird benutzt, kostet aber Boot-Zeit und Strom.
+  cfg.internal_imu = false;
+  cfg.internal_mic = false;
+  cfg.internal_spk = false;
+  cfg.output_power = false;
   M5.begin(cfg);
 
-  WiFi.mode(WIFI_OFF);
-  WiFi.disconnect(true, true);
+  // Vor allem anderen abfragen: wer per PWR geweckt hat, hält jetzt noch.
+  M5.update();
+  bool pwrHeldAtBoot = M5.BtnPWR.isPressed();
+
   M5.Power.setLed(0);
 
   // RTC-IRQ vom Weckvorgang quittieren (sonst Soft-Loops).
@@ -860,15 +1200,25 @@ void setup() {
   setupWatchdog();
 
   prefs.begin(NAMESPACE, false);
-  ensureRtcFromBuildStamp();
-  ensureBaselineCleanDate();
   migrateDiagnostics();
+  diagLoad();
+  // Erst protokollieren, dann korrigieren: ensureRtcFromBuildStamp() loescht
+  // beim Setzen der Uhr das VL-Bit, das wir gerade festhalten wollen.
+  diagBeginBoot(wakeCause);
+  if (ensureRtcFromBuildStamp()) {
+    diagCurrent().flags |= DIAG_F_RTC_RESET;
+    diagFlush();
+  }
+  ensureBaselineCleanDate();
   loadState();
+  Serial.printf("[state] days=%d lastClean=%lu rtcUsable=%d\n",
+                daysSinceClean, (unsigned long)lastCleanYmd, rtcUsable ? 1 : 0);
   // Jeder Kaltstart: EMA sichern (Power-Off verliert RAM).
   updateBatteryEstimate(true);
 
   picker = 0;
   awakeLimitMs = AWAKE_MS;
+  M5.BtnB.setHoldThresh(DIAG_HOLD_MS);
 
   if (DEMO_DAY_PREVIEW) {
     runDayPreviewDemo();
@@ -885,18 +1235,24 @@ void setup() {
     // Skip bei "gleicher Tag" ließ das Panel weiß (init/flash löscht den
     // Framebuffer; E-Ink hält nur, wenn wir gar nicht re-initen — tun wir aber).
     bool changed = hasDisplayStateChanged();
-    refreshMainScreen(epd_mode_t::epd_quality);
-    // Voller Wachfenster bei Tageswechsel oder manuellem Wake; Heartbeat kürzer.
-    awakeLimitMs = (changed || isButtonWake(wakeCause) || wakeCause == ESP_SLEEP_WAKEUP_UNDEFINED)
+    // Nicht epd_quality: dessen Doppel-Refresh im Panel-Treiber wartet nach dem
+    // Refresh-Kommando nur 320 ms und schreibt dann weiter SPI, während BUSY
+    // noch aktiv ist — das erzeugt halbe Bilder.
+    refreshMainScreen(epd_mode_t::epd_fast);
+
+    // Volles Fenster bei Tageswechsel, manuellem Wake und nach Flash/Absturz.
+    // Stiller RTC-Wake bekommt nur den Heartbeat; greift der Nutzer doch zu,
+    // verlängert userActive() in loop() wieder auf AWAKE_MS.
+    bool manualWake = pwrHeldAtBoot || isButtonWake(wakeCause);
+    bool plannedWake = previousBootPoweredOff();
+    awakeLimitMs = (changed || manualWake || !plannedWake)
         ? (uint32_t)AWAKE_MS
         : (uint32_t)HEARTBEAT_AWAKE_MS;
-    // Kaltstart nach Flash/PWR ist UNDEFINED → volle Wachzeit (Menü bedienbar).
-    if (wakeCause == ESP_SLEEP_WAKEUP_UNDEFINED) {
-      awakeLimitMs = AWAKE_MS;
-    }
+    Serial.printf("[wake] changed=%d manual=%d planned=%d awake=%ums\n",
+                  changed ? 1 : 0, manualWake ? 1 : 0, plannedWake ? 1 : 0,
+                  (unsigned)awakeLimitMs);
   }
 
-  M5.Speaker.setVolume(0);
   // LED kurz: Gerät ist wach und bedienbar (Wahlhebel wirkt nur JETZT).
   M5.Power.setLed(128);
   delay(80);
@@ -906,6 +1262,7 @@ void setup() {
 
 void loop() {
   static uint32_t awakeStart = millis();
+  static uint32_t bootStart = millis();
 
   feedWatchdog();
   M5.update();
@@ -916,51 +1273,78 @@ void loop() {
     awakeLimitMs = AWAKE_MS;
   }
 
-  bool enteredSelection = false;
-  if (!selecting && dialClicked()) {
-    selecting = true;
-    picker = 0;
-    enteredSelection = true;
-    enterSelectionScreen();
-  }
+  if (showingDiag) {
+    if (dialClicked()) {
+      showingDiag = false;
+      screenDirty = true;
+    }
+  } else if (!selecting && M5.BtnB.wasHold()) {
+    showingDiag = true;
+    drawDiagScreen();
+  } else {
+    bool enteredSelection = false;
+    if (!selecting && dialClicked()) {
+      selecting = true;
+      picker = 0;
+      enteredSelection = true;
+      enterSelectionScreen();
+    }
 
-  if (selecting && !enteredSelection) {
-    // Dial Up = vorherige Zeile, Dial Down = nächste, Mid = OK
-    if (M5.BtnA.wasClicked()) {
-      uint8_t previousPicker = picker;
-      picker = (picker + SELECTION_ITEM_COUNT - 1) % SELECTION_ITEM_COUNT;
-      updateSelectionPicker(previousPicker);
-    }
-    if (M5.BtnC.wasClicked()) {
-      uint8_t previousPicker = picker;
-      picker = (picker + 1) % SELECTION_ITEM_COUNT;
-      updateSelectionPicker(previousPicker);
-    }
-    if (M5.BtnB.wasClicked()) {
-      selecting = false;
-      awakeStart = millis();
-      if (picker == SELECTION_BACK_INDEX) {
-        refreshMainScreen(epd_mode_t::epd_fastest);
-      } else {
-        saveCleaning(picker);
+    if (selecting && !enteredSelection) {
+      // Dial Up = vorherige Zeile, Dial Down = nächste, Mid = OK
+      if (M5.BtnA.wasClicked()) {
+        uint8_t previousPicker = picker;
+        picker = (picker + SELECTION_ITEM_COUNT - 1) % SELECTION_ITEM_COUNT;
+        updateSelectionPicker(previousPicker);
+      }
+      if (M5.BtnC.wasClicked()) {
+        uint8_t previousPicker = picker;
+        picker = (picker + 1) % SELECTION_ITEM_COUNT;
+        updateSelectionPicker(previousPicker);
+      }
+      if (M5.BtnB.wasClicked()) {
+        selecting = false;
+        awakeStart = millis();
+        if (picker != SELECTION_BACK_INDEX && !saveCleaning(picker)) {
+          Serial.printf("[state] Reinigung nicht gespeichert — RTC unbrauchbar\n");
+        }
         refreshMainScreen(epd_mode_t::epd_fastest);
       }
     }
+
+    if (!selecting && screenDirty) {
+      refreshMainScreen(epd_mode_t::epd_fastest);
+    }
   }
 
-  if (!selecting && screenDirty) {
-    refreshMainScreen(epd_mode_t::epd_fastest);
-  }
+  bool windowOver = (millis() - awakeStart) >= awakeLimitMs;
+  // Harte Obergrenze unabhängig von den Tasten: ein klemmender Eingang darf
+  // das Gerät nicht bis zum leeren Akku wachhalten.
+  bool hardLimit = (millis() - bootStart) >= MAX_AWAKE_MS;
 
-  if ((millis() - awakeStart) >= awakeLimitMs) {
+  if (windowOver || hardLimit) {
+    if (hardLimit && !windowOver) {
+      Serial.printf("[loop] Hard-Limit %ums erreicht — Tasten klemmen?\n",
+                    (unsigned)MAX_AWAKE_MS);
+    }
+    if (showingDiag) {
+      showingDiag = false;
+      screenDirty = true;
+    }
     if (selecting) {
       selecting = false;
       screenDirty = true;
+    }
+    if (screenDirty) {
       refreshMainScreen(epd_mode_t::epd_fastest);
     }
+    // Kehrt nur zurueck, wenn der Power-Off nicht greifen konnte. Dann ist das
+    // Datum inzwischen weitergelaufen — Zustand neu einlesen und neu zeichnen.
     enterIdleSleep();
-    // Nur erreichbar, wenn Power-Off fehlschlug (z. B. USB): neu wach.
+    loadState();
+    screenDirty = true;
     awakeStart = millis();
+    bootStart = millis();
     awakeLimitMs = AWAKE_MS;
   }
 
