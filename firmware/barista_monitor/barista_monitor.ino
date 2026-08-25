@@ -773,7 +773,7 @@ void drawDayIndicatorLabel() {
 
 /** Letzte Boots am Gerät ablesbar machen — ohne USB, nach dem Freeze. */
 void drawDiagScreen() {
-  M5.Display.setEpdMode(epd_mode_t::epd_fastest);
+  M5.Display.setEpdMode(epd_mode_t::epd_fast);
   M5.Display.startWrite();
   M5.Display.fillScreen(TFT_WHITE);
   M5.Display.setTextFont(&fonts::AsciiFont8x16);
@@ -869,16 +869,19 @@ void drawSelectionDateTime() {
  * "eingefroren" stehenbleiben.
  */
 void waitPanelIdle(uint32_t timeoutMs) {
-  delay(50);  // BUSY geht erst nach dem Latch des Refresh-Kommandos auf LOW
+  delay(50);  // BUSY wird erst nach dem Latch des Refresh-Kommandos aktiv
   uint32_t start = millis();
-  while ((millis() - start) < timeoutMs) {
-    if (digitalRead(EPD_BUSY_PIN) == HIGH) {
+  // displayBusy() und nicht digitalRead(EPD_BUSY_PIN): die beiden auf dem
+  // CoreInk verbauten Panels haben entgegengesetzte BUSY-Polaritaet
+  // (M09 aktiv LOW, D67 aktiv HIGH). Nur der Panel-Treiber weiss, welches.
+  while (M5.Display.displayBusy()) {
+    if ((millis() - start) >= timeoutMs) {
+      Serial.printf("[epd] BUSY nach %ums noch aktiv\n", (unsigned)timeoutMs);
       return;
     }
     feedWatchdog();
     delay(10);
   }
-  Serial.printf("[epd] BUSY nach %ums noch aktiv\n", (unsigned)timeoutMs);
 }
 
 void commitDisplay() {
@@ -985,7 +988,7 @@ void runBatteryPreviewDemo() {
 }
 
 void enterSelectionScreen() {
-  M5.Display.setEpdMode(epd_mode_t::epd_fastest);
+  M5.Display.setEpdMode(epd_mode_t::epd_fast);
   M5.Display.startWrite();
   M5.Display.fillScreen(TFT_WHITE);
   for (uint8_t i = 0; i < SELECTION_ITEM_COUNT; i++) {
@@ -996,7 +999,7 @@ void enterSelectionScreen() {
 }
 
 void updateSelectionPicker(uint8_t previousPicker) {
-  M5.Display.setEpdMode(epd_mode_t::epd_fastest);
+  M5.Display.setEpdMode(epd_mode_t::epd_fast);
   M5.Display.startWrite();
   drawSelectionRow(previousPicker, false);
   drawSelectionRow(picker, true);
@@ -1193,6 +1196,9 @@ void setup() {
   bool pwrHeldAtBoot = M5.BtnPWR.isPressed();
 
   M5.Power.setLed(0);
+  Serial.printf("[epd] busy pin=%d raw=%d busy=%d\n",
+                EPD_BUSY_PIN, digitalRead(EPD_BUSY_PIN),
+                M5.Display.displayBusy() ? 1 : 0);
 
   // RTC-IRQ vom Weckvorgang quittieren (sonst Soft-Loops).
   M5.Rtc.clearIRQ();
@@ -1235,10 +1241,11 @@ void setup() {
     // Skip bei "gleicher Tag" ließ das Panel weiß (init/flash löscht den
     // Framebuffer; E-Ink hält nur, wenn wir gar nicht re-initen — tun wir aber).
     bool changed = hasDisplayStateChanged();
-    // Nicht epd_quality: dessen Doppel-Refresh im Panel-Treiber wartet nach dem
-    // Refresh-Kommando nur 320 ms und schreibt dann weiter SPI, während BUSY
-    // noch aktiv ist — das erzeugt halbe Bilder.
-    refreshMainScreen(epd_mode_t::epd_fast);
+    // Nur beim Tageswechsel der teure Quality-Refresh (Mode 1, flickernd) —
+    // der entfernt das Ghosting. Sonst Mode 2 (differenziell, kein Flackern).
+    // Ueberall sonst dieselbe Mode benutzen: der Panel-Treiber erzwingt bei
+    // jedem Moduswechsel einen Vollbild-Redraw samt Flip-Draw.
+    refreshMainScreen(changed ? epd_mode_t::epd_quality : epd_mode_t::epd_fast);
 
     // Volles Fenster bei Tageswechsel, manuellem Wake und nach Flash/Absturz.
     // Stiller RTC-Wake bekommt nur den Heartbeat; greift der Nutzer doch zu,
@@ -1308,12 +1315,12 @@ void loop() {
         if (picker != SELECTION_BACK_INDEX && !saveCleaning(picker)) {
           Serial.printf("[state] Reinigung nicht gespeichert — RTC unbrauchbar\n");
         }
-        refreshMainScreen(epd_mode_t::epd_fastest);
+        refreshMainScreen(epd_mode_t::epd_fast);
       }
     }
 
     if (!selecting && screenDirty) {
-      refreshMainScreen(epd_mode_t::epd_fastest);
+      refreshMainScreen(epd_mode_t::epd_fast);
     }
   }
 
@@ -1336,7 +1343,7 @@ void loop() {
       screenDirty = true;
     }
     if (screenDirty) {
-      refreshMainScreen(epd_mode_t::epd_fastest);
+      refreshMainScreen(epd_mode_t::epd_fast);
     }
     // Kehrt nur zurueck, wenn der Power-Off nicht greifen konnte. Dann ist das
     // Datum inzwischen weitergelaufen — Zustand neu einlesen und neu zeichnen.
