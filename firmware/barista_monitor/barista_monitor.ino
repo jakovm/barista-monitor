@@ -4,6 +4,7 @@
 #include <esp_adc_cal.h>
 #include <esp_sleep.h>
 #include <esp_task_wdt.h>
+#include <string.h>
 #include "rtc_stamp.h"
 
 static constexpr const char* NAMESPACE = "coffee";
@@ -17,8 +18,23 @@ static constexpr const char* KEY_RENDER_DAYS = "rDays";
 static constexpr const char* KEY_RENDER_BAT = "rBat";
 static constexpr uint8_t DIAG_VERSION = 1;
 
-static constexpr const char* CLEANERS[] = {"Jakov", "Nina", "Guest"};
-static constexpr uint8_t CLEANER_COUNT = 3;
+/** Feste Slots. Umbenennen behält den Zähler, Leeren löscht ihn. */
+static constexpr uint8_t MAX_CLEANERS = 4;
+/** AsciiFont8x16 Größe 2: 9 Zeichen lassen rechts noch Platz für den Zähler. */
+static constexpr uint8_t CLEANER_NAME_MAX = 9;
+static constexpr uint8_t LIST_MAX = 6;
+/** AsciiFont kennt keine Umlaute. */
+static const char EDIT_CHARSET[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-";
+
+enum class Mode : uint8_t { Main, Root, Clean, Stats, Names, Edit };
+
+enum ListTag : uint8_t {
+  TAG_BACK = 32,
+  TAG_ADD = 33,
+  TAG_CLEAN = 34,
+  TAG_STATS = 35,
+  TAG_NAMES = 36,
+};
 
 static constexpr uint8_t CLEAN_DAYS_GRAY_START = 5;
 static constexpr uint8_t CLEAN_DAYS_INVERT = 7;
@@ -66,9 +82,21 @@ static constexpr int DAILY_ROLLOVER_HOUR = 0;
 static constexpr float BAT_EMA_PERSIST_DELTA = 0.02f;
 
 Preferences prefs;
-bool selecting = false;
+Mode mode = Mode::Main;
 uint8_t picker = 0;
 bool screenDirty = true;
+char cleanerNames[MAX_CLEANERS][CLEANER_NAME_MAX + 1];
+uint16_t cleanerCounts[MAX_CLEANERS];
+char listLabels[LIST_MAX][CLEANER_NAME_MAX + 1];
+uint8_t listTags[LIST_MAX];
+uint8_t listCount = 0;
+char editBuf[CLEANER_NAME_MAX + 1];
+char editNote[12];
+uint8_t editLen = 0;
+uint8_t editCursor = 0;
+uint8_t editSlot = 0;
+uint8_t editPicker = 0;
+bool editSpin = false;
 int daysSinceClean = 0;
 uint32_t lastCleanYmd = 0;
 uint8_t lastCleaner = 0;
@@ -194,12 +222,101 @@ void ensureBaselineCleanDate() {
   prefs.putUInt(KEY_LAST_DATE, ymdToKey(calendarToday()));
 }
 
+uint8_t countActive() {
+  uint8_t n = 0;
+  for (uint8_t i = 0; i < MAX_CLEANERS; i++) {
+    if (cleanerNames[i][0] != 0) {
+      n++;
+    }
+  }
+  return n;
+}
+
+uint8_t firstActiveSlot() {
+  for (uint8_t i = 0; i < MAX_CLEANERS; i++) {
+    if (cleanerNames[i][0] != 0) {
+      return i;
+    }
+  }
+  return 0;
+}
+
+int firstFreeSlot() {
+  for (uint8_t i = 0; i < MAX_CLEANERS; i++) {
+    if (cleanerNames[i][0] == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+void slotNameKey(uint8_t slot, char* out) {
+  snprintf(out, 4, "n%u", slot);
+}
+
+void slotCountKey(uint8_t slot, char* out) {
+  snprintf(out, 4, "k%u", slot);
+}
+
+void sanitizeName(char* name) {
+  size_t w = 0;
+  for (size_t r = 0; name[r] != 0 && w < CLEANER_NAME_MAX; r++) {
+    char c = name[r];
+    bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+        || (c >= '0' && c <= '9') || c == '-';
+    if (ok) {
+      name[w++] = c;
+    }
+  }
+  name[w] = 0;
+}
+
+void persistSlot(uint8_t slot) {
+  char key[4];
+  slotNameKey(slot, key);
+  prefs.putString(key, cleanerNames[slot]);
+  slotCountKey(slot, key);
+  prefs.putUShort(key, cleanerCounts[slot]);
+}
+
+void seedDefaultCleaners() {
+  const char* defaults[MAX_CLEANERS] = {"Jakov", "Nina", "Guest", ""};
+  for (uint8_t i = 0; i < MAX_CLEANERS; i++) {
+    strncpy(cleanerNames[i], defaults[i], CLEANER_NAME_MAX);
+    cleanerNames[i][CLEANER_NAME_MAX] = 0;
+    cleanerCounts[i] = 0;
+    persistSlot(i);
+  }
+}
+
+void loadCleaners() {
+  if (!prefs.isKey("n0")) {
+    seedDefaultCleaners();
+    return;
+  }
+
+  for (uint8_t i = 0; i < MAX_CLEANERS; i++) {
+    char key[4];
+    cleanerNames[i][0] = 0;
+    slotNameKey(i, key);
+    prefs.getString(key, cleanerNames[i], CLEANER_NAME_MAX + 1);
+    cleanerNames[i][CLEANER_NAME_MAX] = 0;
+    sanitizeName(cleanerNames[i]);
+    slotCountKey(i, key);
+    cleanerCounts[i] = prefs.getUShort(key, 0);
+  }
+
+  if (countActive() == 0) {
+    seedDefaultCleaners();
+  }
+}
+
 void loadState() {
   uint32_t today = ymdToKey(calendarToday());
   lastCleanYmd = prefs.getUInt(KEY_LAST_DATE, today);
   lastCleaner = prefs.getUChar(KEY_CLEANER, 0);
-  if (lastCleaner >= CLEANER_COUNT) {
-    lastCleaner = 0;
+  if (lastCleaner >= MAX_CLEANERS || cleanerNames[lastCleaner][0] == 0) {
+    lastCleaner = firstActiveSlot();
   }
 
   daysSinceClean = daysBetween(keyToYmd(lastCleanYmd), keyToYmd(today));
@@ -210,12 +327,22 @@ void loadState() {
   inverted = daysSinceClean > CLEAN_DAYS_INVERT;
 }
 
-void saveCleaning(uint8_t cleanerIndex) {
+void saveCleaning(uint8_t slot) {
+  if (slot >= MAX_CLEANERS || cleanerNames[slot][0] == 0) {
+    return;
+  }
+
   Ymd today = calendarToday();
   lastCleanYmd = ymdToKey(today);
-  lastCleaner = cleanerIndex % CLEANER_COUNT;
+  lastCleaner = slot;
   prefs.putUInt(KEY_LAST_DATE, lastCleanYmd);
   prefs.putUChar(KEY_CLEANER, lastCleaner);
+  if (cleanerCounts[slot] < 65535) {
+    cleanerCounts[slot]++;
+  }
+  char key[4];
+  slotCountKey(slot, key);
+  prefs.putUShort(key, cleanerCounts[slot]);
   daysSinceClean = 0;
   inverted = false;
   screenDirty = true;
@@ -584,61 +711,9 @@ void drawMainScreen() {
   drawBatteryIndicator();
 }
 
-static constexpr uint8_t SELECTION_ITEM_COUNT = CLEANER_COUNT + 1;
-static constexpr uint8_t SELECTION_BACK_INDEX = CLEANER_COUNT;
-static constexpr int SELECTION_TOP = 2;
-static constexpr int SELECTION_BOTTOM_MARGIN = 2;
-static constexpr int SELECTION_DATETIME_H = 16;
-static constexpr int SELECTION_DATETIME_GAP = 2;
-static constexpr int SELECTION_MENU_BOTTOM =
-    SCREEN_H - SELECTION_BOTTOM_MARGIN - SELECTION_DATETIME_H - SELECTION_DATETIME_GAP;
-static constexpr int SELECTION_MENU_H = SELECTION_MENU_BOTTOM - SELECTION_TOP;
-static constexpr int SELECTION_ROW_H = SELECTION_MENU_H / SELECTION_ITEM_COUNT;
-static constexpr int SELECTION_DATETIME_Y = SCREEN_H - SELECTION_BOTTOM_MARGIN;
-
-int selectionRowCenterY(uint8_t index) {
-  return SELECTION_TOP + ((index * 2 + 1) * SELECTION_MENU_H) / (SELECTION_ITEM_COUNT * 2);
-}
-
-const char* selectionLabel(uint8_t index) {
-  if (index < CLEANER_COUNT) {
-    return CLEANERS[index];
-  }
-  return "back";
-}
-
-void drawSelectionRow(uint8_t index, bool selected) {
-  int rowY = selectionRowCenterY(index);
-  int bandY = rowY - SELECTION_ROW_H / 2;
-
-  M5.Display.fillRect(0, bandY, SCREEN_W, SELECTION_ROW_H, selected ? TFT_BLACK : TFT_WHITE);
-  M5.Display.setTextFont(&fonts::AsciiFont8x16);
-  M5.Display.setTextColor(selected ? TFT_WHITE : TFT_BLACK, selected ? TFT_BLACK : TFT_WHITE);
-  M5.Display.setTextSize(2);
-  M5.Display.setTextDatum(middle_center);
-  M5.Display.drawString(selectionLabel(index), SCREEN_W / 2, rowY);
-}
-
-void drawSelectionDateTime() {
-  char dateTimeText[24];
-  char daysText[8];
-  formatRtcDateTime(dateTimeText, sizeof(dateTimeText));
-  formatBatteryDaysRemaining(daysText, sizeof(daysText));
-
-  static constexpr int FOOTER_PAD_X = 4;
-
-  int footerY = SELECTION_MENU_BOTTOM;
-  M5.Display.fillRect(0, footerY, SCREEN_W, SCREEN_H - footerY, TFT_WHITE);
-  M5.Display.setTextFont(&fonts::AsciiFont8x16);
-  M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
-  M5.Display.setTextSize(1);
-
-  M5.Display.setTextDatum(bottom_left);
-  M5.Display.drawString(dateTimeText, FOOTER_PAD_X, SELECTION_DATETIME_Y);
-
-  M5.Display.setTextDatum(bottom_right);
-  M5.Display.drawString(daysText, SCREEN_W - FOOTER_PAD_X, SELECTION_DATETIME_Y);
-}
+static constexpr int LIST_TOP = 2;
+static constexpr int LIST_DATETIME_H = 16;
+static constexpr int LIST_DATETIME_Y = SCREEN_H - 2;
 
 void commitDisplay() {
   M5.Display.endWrite();
@@ -667,9 +742,9 @@ void feedWatchdog() {
   esp_task_wdt_reset();
 }
 
-void refreshMainScreen(epd_mode_t mode) {
+void refreshMainScreen(epd_mode_t epdMode) {
   feedWatchdog();
-  M5.Display.setEpdMode(mode);
+  M5.Display.setEpdMode(epdMode);
   M5.Display.startWrite();
   drawMainScreen();
   commitDisplay();
@@ -742,23 +817,548 @@ void runBatteryPreviewDemo() {
   batteryDemoActive = false;
 }
 
-void enterSelectionScreen() {
+void addListItem(const char* label, uint8_t tag) {
+  if (listCount >= LIST_MAX) {
+    return;
+  }
+  strncpy(listLabels[listCount], label, CLEANER_NAME_MAX);
+  listLabels[listCount][CLEANER_NAME_MAX] = 0;
+  listTags[listCount] = tag;
+  listCount++;
+}
+
+void buildList() {
+  listCount = 0;
+  if (mode == Mode::Root) {
+    addListItem("clean", TAG_CLEAN);
+    addListItem("stats", TAG_STATS);
+    addListItem("names", TAG_NAMES);
+    addListItem("back", TAG_BACK);
+    return;
+  }
+
+  for (uint8_t i = 0; i < MAX_CLEANERS; i++) {
+    if (cleanerNames[i][0] != 0) {
+      addListItem(cleanerNames[i], i);
+    }
+  }
+  if (mode == Mode::Names && countActive() < MAX_CLEANERS) {
+    addListItem("add", TAG_ADD);
+  }
+  addListItem("back", TAG_BACK);
+}
+
+int listMenuBottom() {
+  if (listCount <= 4) {
+    return SCREEN_H - 2 - LIST_DATETIME_H - 2;
+  }
+  return SCREEN_H - 2;
+}
+
+int listMenuH() {
+  return listMenuBottom() - LIST_TOP;
+}
+
+int listRowCenterY(uint8_t index) {
+  return LIST_TOP + ((int)index * 2 + 1) * listMenuH() / ((int)listCount * 2);
+}
+
+int listRowH() {
+  if (listCount == 0) {
+    return 1;
+  }
+  return listMenuH() / (int)listCount;
+}
+
+void drawListFooter() {
+  char dateTimeText[24];
+  char daysText[8];
+  formatRtcDateTime(dateTimeText, sizeof(dateTimeText));
+  formatBatteryDaysRemaining(daysText, sizeof(daysText));
+
+  int footerY = listMenuBottom();
+  M5.Display.fillRect(0, footerY, SCREEN_W, SCREEN_H - footerY, TFT_WHITE);
+  M5.Display.setTextFont(&fonts::AsciiFont8x16);
+  M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextDatum(bottom_left);
+  M5.Display.drawString(dateTimeText, 4, LIST_DATETIME_Y);
+  M5.Display.setTextDatum(bottom_right);
+  M5.Display.drawString(daysText, SCREEN_W - 4, LIST_DATETIME_Y);
+}
+
+void drawListRow(uint8_t index, bool selected) {
+  int rowY = listRowCenterY(index);
+  int bandH = listRowH();
+  int bandY = rowY - bandH / 2;
+  uint16_t bg = selected ? TFT_BLACK : TFT_WHITE;
+  uint16_t fg = selected ? TFT_WHITE : TFT_BLACK;
+
+  M5.Display.fillRect(0, bandY, SCREEN_W, bandH, bg);
+  M5.Display.setTextFont(&fonts::AsciiFont8x16);
+  M5.Display.setTextColor(fg, bg);
+  M5.Display.setTextSize(2);
+
+  if (mode == Mode::Stats && listTags[index] < MAX_CLEANERS) {
+    uint8_t slot = listTags[index];
+    char countBuf[8];
+    snprintf(countBuf, sizeof(countBuf), "%u", (unsigned)cleanerCounts[slot]);
+    bool wideCount = strlen(cleanerNames[slot]) <= 7;
+    M5.Display.setTextDatum(middle_left);
+    M5.Display.drawString(cleanerNames[slot], 6, rowY);
+    M5.Display.setTextSize(wideCount ? 2 : 1);
+    M5.Display.setTextDatum(middle_right);
+    M5.Display.drawString(countBuf, SCREEN_W - 6, rowY);
+    return;
+  }
+
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.drawString(listLabels[index], SCREEN_W / 2, rowY);
+}
+
+void enterList(Mode next) {
+  mode = next;
+  editSpin = false;
+  picker = 0;
+  buildList();
+  if (listCount == 0) {
+    return;
+  }
+
+  feedWatchdog();
   M5.Display.setEpdMode(epd_mode_t::epd_fastest);
   M5.Display.startWrite();
   M5.Display.fillScreen(TFT_WHITE);
-  for (uint8_t i = 0; i < SELECTION_ITEM_COUNT; i++) {
-    drawSelectionRow(i, i == picker);
+  for (uint8_t i = 0; i < listCount; i++) {
+    drawListRow(i, i == picker);
   }
-  drawSelectionDateTime();
+  if (listCount <= 4) {
+    drawListFooter();
+  }
+  commitDisplay();
+  feedWatchdog();
+}
+
+void updateListPicker(uint8_t previousPicker) {
+  M5.Display.setEpdMode(epd_mode_t::epd_fastest);
+  M5.Display.startWrite();
+  drawListRow(previousPicker, false);
+  drawListRow(picker, true);
   commitDisplay();
 }
 
-void updateSelectionPicker(uint8_t previousPicker) {
+void showMain() {
+  mode = Mode::Main;
+  editSpin = false;
+  refreshMainScreen(epd_mode_t::epd_fastest);
+}
+
+void movePicker(int dir, uint8_t count, void (*redraw)(uint8_t)) {
+  if (count == 0) {
+    return;
+  }
+  uint8_t previous = picker;
+  int next = (int)picker + dir;
+  if (next < 0) {
+    next = (int)count - 1;
+  }
+  if (next >= (int)count) {
+    next = 0;
+  }
+  picker = (uint8_t)next;
+  redraw(previous);
+}
+
+static constexpr int EDIT_PREVIEW_H = 48;
+static constexpr int EDIT_HINT_Y = 48;
+static constexpr int EDIT_HINT_H = 18;
+static constexpr int EDIT_MENU_TOP_IDLE = 50;
+static constexpr int EDIT_MENU_TOP_SPIN = 68;
+static constexpr int EDIT_MENU_BOTTOM = 198;
+static constexpr uint8_t EDIT_ROWS = 5;
+
+int editMenuTop() {
+  return editSpin ? EDIT_MENU_TOP_SPIN : EDIT_MENU_TOP_IDLE;
+}
+
+int editMenuH() {
+  return EDIT_MENU_BOTTOM - editMenuTop();
+}
+
+int editRowCenterY(uint8_t index) {
+  return editMenuTop() + ((int)index * 2 + 1) * editMenuH() / (EDIT_ROWS * 2);
+}
+
+int editRowH() {
+  return editMenuH() / EDIT_ROWS;
+}
+
+char editCursorChar() {
+  if (editCursor < editLen) {
+    return editBuf[editCursor];
+  }
+  return '_';
+}
+
+void drawEditPreview() {
+  M5.Display.fillRect(0, 0, SCREEN_W, EDIT_PREVIEW_H, TFT_WHITE);
+  M5.Display.setTextFont(&fonts::AsciiFont8x16);
+  M5.Display.setTextSize(2);
+  M5.Display.setTextDatum(middle_center);
+
+  if (editNote[0] != 0) {
+    M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
+    M5.Display.drawString(editNote, SCREEN_W / 2, EDIT_PREVIEW_H / 2);
+    return;
+  }
+
+  bool phantom = editLen < CLEANER_NAME_MAX && (editLen == 0 || editCursor >= editLen);
+  uint8_t cells = editLen + (phantom ? 1 : 0);
+  if (cells == 0) {
+    cells = 1;
+  }
+
+  static constexpr int PITCH = 20;
+  static constexpr int CELL_W = 18;
+  static constexpr int CELL_H = 40;
+  int x = (SCREEN_W - (int)cells * PITCH) / 2;
+  int y = (EDIT_PREVIEW_H - CELL_H) / 2;
+
+  for (uint8_t i = 0; i < cells; i++) {
+    bool onCursor = i == editCursor;
+    char ch = (i < editLen) ? editBuf[i] : '_';
+    uint16_t bg = onCursor ? TFT_BLACK : TFT_WHITE;
+    uint16_t fg = onCursor ? TFT_WHITE : TFT_BLACK;
+    char tmp[2] = {ch, 0};
+    M5.Display.fillRect(x, y, CELL_W, CELL_H, bg);
+    M5.Display.drawRect(x, y, CELL_W, CELL_H, fg);
+    M5.Display.setTextColor(fg, bg);
+    M5.Display.drawString(tmp, x + CELL_W / 2, y + CELL_H / 2);
+    x += PITCH;
+  }
+}
+
+void drawEditHint() {
+  M5.Display.fillRect(0, EDIT_HINT_Y, SCREEN_W, EDIT_HINT_H, TFT_WHITE);
+  M5.Display.setTextFont(&fonts::AsciiFont8x16);
+  M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.drawString("mid next   hold mid back", SCREEN_W / 2, EDIT_HINT_Y + EDIT_HINT_H / 2);
+}
+
+void drawEditRow(uint8_t index, bool selected) {
+  int rowY = editRowCenterY(index);
+  int bandH = editRowH();
+  int bandY = rowY - bandH / 2;
+  uint16_t bg = selected ? TFT_BLACK : TFT_WHITE;
+  uint16_t fg = selected ? TFT_WHITE : TFT_BLACK;
+  char label[16];
+
+  if (index == 0) {
+    snprintf(label, sizeof(label), "change %c", editCursorChar());
+  } else {
+    const char* labels[] = {"change", "next", "delete", "save", "back"};
+    snprintf(label, sizeof(label), "%s", labels[index]);
+  }
+
+  M5.Display.fillRect(0, bandY, SCREEN_W, bandH, bg);
+  M5.Display.setTextFont(&fonts::AsciiFont8x16);
+  M5.Display.setTextColor(fg, bg);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextDatum(middle_center);
+  M5.Display.drawString(label, SCREEN_W / 2, rowY);
+}
+
+void redrawEdit() {
+  feedWatchdog();
   M5.Display.setEpdMode(epd_mode_t::epd_fastest);
   M5.Display.startWrite();
-  drawSelectionRow(previousPicker, false);
-  drawSelectionRow(picker, true);
+  M5.Display.fillScreen(TFT_WHITE);
+  drawEditPreview();
+  if (editSpin) {
+    drawEditHint();
+  }
+  for (uint8_t i = 0; i < EDIT_ROWS; i++) {
+    drawEditRow(i, i == editPicker);
+  }
   commitDisplay();
+  feedWatchdog();
+}
+
+void refreshEditDynamic() {
+  M5.Display.setEpdMode(epd_mode_t::epd_fastest);
+  M5.Display.startWrite();
+  drawEditPreview();
+  drawEditRow(0, editPicker == 0);
+  commitDisplay();
+}
+
+void beginEdit(uint8_t slot) {
+  editSlot = slot;
+  editNote[0] = 0;
+  editSpin = false;
+  editPicker = 0;
+  strncpy(editBuf, cleanerNames[slot], CLEANER_NAME_MAX);
+  editBuf[CLEANER_NAME_MAX] = 0;
+  editLen = (uint8_t)strlen(editBuf);
+  editCursor = 0;
+  mode = Mode::Edit;
+  redrawEdit();
+}
+
+void stepEditChar(int dir) {
+  editNote[0] = 0;
+  int charsetLen = (int)strlen(EDIT_CHARSET);
+  bool append = editCursor >= editLen;
+  int idx = 0;
+  if (!append) {
+    const char* found = strchr(EDIT_CHARSET, editBuf[editCursor]);
+    idx = found ? (int)(found - EDIT_CHARSET) : 0;
+  } else {
+    idx = dir > 0 ? -1 : charsetLen;
+  }
+  idx += dir;
+  if (idx < 0) {
+    idx = charsetLen - 1;
+  }
+  if (idx >= charsetLen) {
+    idx = 0;
+  }
+  if (append) {
+    if (editLen >= CLEANER_NAME_MAX) {
+      return;
+    }
+    editBuf[editLen] = EDIT_CHARSET[idx];
+    editLen++;
+    editBuf[editLen] = 0;
+    editCursor = editLen - 1;
+    return;
+  }
+  editBuf[editCursor] = EDIT_CHARSET[idx];
+}
+
+void moveEditCursor(int dir) {
+  editNote[0] = 0;
+  if (editLen == 0) {
+    editCursor = 0;
+    return;
+  }
+  int maxCursor = (editLen < CLEANER_NAME_MAX) ? (int)editLen : (int)editLen - 1;
+  int next = (int)editCursor + dir;
+  if (next < 0) {
+    next = maxCursor;
+  }
+  if (next > maxCursor) {
+    next = 0;
+  }
+  editCursor = (uint8_t)next;
+}
+
+void deleteEditChar() {
+  editNote[0] = 0;
+  if (editLen == 0) {
+    return;
+  }
+  uint8_t idx = (editCursor >= editLen) ? editLen - 1 : editCursor;
+  memmove(&editBuf[idx], &editBuf[idx + 1], editLen - idx);
+  editLen--;
+  editBuf[editLen] = 0;
+  if (editCursor > editLen) {
+    editCursor = editLen;
+  }
+}
+
+void setEditNote(const char* note) {
+  strncpy(editNote, note, sizeof(editNote) - 1);
+  editNote[sizeof(editNote) - 1] = 0;
+  refreshEditDynamic();
+}
+
+void saveEdit() {
+  if (editLen == 0) {
+    if (cleanerNames[editSlot][0] == 0) {
+      enterList(Mode::Names);
+      return;
+    }
+    if (countActive() <= 1) {
+      setEditNote("keep one");
+      return;
+    }
+    cleanerNames[editSlot][0] = 0;
+    cleanerCounts[editSlot] = 0;
+    persistSlot(editSlot);
+    if (lastCleaner == editSlot) {
+      lastCleaner = firstActiveSlot();
+      prefs.putUChar(KEY_CLEANER, lastCleaner);
+    }
+    enterList(Mode::Names);
+    return;
+  }
+
+  editBuf[editLen] = 0;
+  for (uint8_t i = 0; i < MAX_CLEANERS; i++) {
+    if (i != editSlot && cleanerNames[i][0] != 0 && strcmp(cleanerNames[i], editBuf) == 0) {
+      setEditNote("taken");
+      return;
+    }
+  }
+
+  strncpy(cleanerNames[editSlot], editBuf, CLEANER_NAME_MAX);
+  cleanerNames[editSlot][CLEANER_NAME_MAX] = 0;
+  persistSlot(editSlot);
+  enterList(Mode::Names);
+}
+
+void updateEditPicker(uint8_t previousPicker) {
+  M5.Display.setEpdMode(epd_mode_t::epd_fastest);
+  M5.Display.startWrite();
+  drawEditRow(previousPicker, false);
+  drawEditRow(editPicker, true);
+  commitDisplay();
+}
+
+void activateEditRow() {
+  if (editPicker == 0) {
+    editSpin = true;
+    editNote[0] = 0;
+    redrawEdit();
+    return;
+  }
+  if (editPicker == 1) {
+    moveEditCursor(1);
+    refreshEditDynamic();
+    return;
+  }
+  if (editPicker == 2) {
+    deleteEditChar();
+    refreshEditDynamic();
+    return;
+  }
+  if (editPicker == 3) {
+    saveEdit();
+    return;
+  }
+  enterList(Mode::Names);
+}
+
+bool takeRepeat(m5::Button_Class& btn, uint32_t& nextMs) {
+  uint32_t now = millis();
+  if (btn.wasPressed()) {
+    nextMs = now + 420;
+    return true;
+  }
+  if (btn.isPressed() && (int32_t)(now - nextMs) >= 0) {
+    nextMs = now + 130;
+    return true;
+  }
+  return false;
+}
+
+void handleEditInput() {
+  static uint32_t upRepeatMs = 0;
+  static uint32_t downRepeatMs = 0;
+
+  if (editSpin) {
+    bool changed = false;
+    if (takeRepeat(M5.BtnA, upRepeatMs)) {
+      stepEditChar(-1);
+      changed = true;
+    }
+    if (takeRepeat(M5.BtnC, downRepeatMs)) {
+      stepEditChar(1);
+      changed = true;
+    }
+    if (M5.BtnB.wasClicked()) {
+      moveEditCursor(1);
+      changed = true;
+    }
+    if (changed) {
+      refreshEditDynamic();
+    }
+    if (M5.BtnB.wasHold() || M5.BtnEXT.wasClicked()) {
+      editSpin = false;
+      redrawEdit();
+    }
+    return;
+  }
+
+  if (M5.BtnA.wasClicked()) {
+    uint8_t previous = editPicker;
+    editPicker = (editPicker + EDIT_ROWS - 1) % EDIT_ROWS;
+    updateEditPicker(previous);
+  }
+  if (M5.BtnC.wasClicked()) {
+    uint8_t previous = editPicker;
+    editPicker = (editPicker + 1) % EDIT_ROWS;
+    updateEditPicker(previous);
+  }
+  if (M5.BtnB.wasClicked()) {
+    activateEditRow();
+  }
+  if (M5.BtnEXT.wasClicked()) {
+    enterList(Mode::Names);
+  }
+}
+
+void confirmList() {
+  uint8_t tag = listTags[picker];
+  if (mode == Mode::Root) {
+    if (tag == TAG_CLEAN) {
+      enterList(Mode::Clean);
+    } else if (tag == TAG_STATS) {
+      enterList(Mode::Stats);
+    } else if (tag == TAG_NAMES) {
+      enterList(Mode::Names);
+    } else {
+      showMain();
+    }
+    return;
+  }
+  if (mode == Mode::Clean) {
+    if (tag == TAG_BACK) {
+      enterList(Mode::Root);
+    } else {
+      saveCleaning(tag);
+      showMain();
+    }
+    return;
+  }
+  if (mode == Mode::Stats) {
+    if (tag == TAG_BACK) {
+      enterList(Mode::Root);
+    }
+    return;
+  }
+  if (tag == TAG_BACK) {
+    enterList(Mode::Root);
+  } else if (tag == TAG_ADD) {
+    int slot = firstFreeSlot();
+    if (slot >= 0) {
+      beginEdit((uint8_t)slot);
+    }
+  } else {
+    beginEdit(tag);
+  }
+}
+
+void handleListInput() {
+  if (M5.BtnA.wasClicked()) {
+    movePicker(-1, listCount, updateListPicker);
+  }
+  if (M5.BtnC.wasClicked()) {
+    movePicker(1, listCount, updateListPicker);
+  }
+  if (M5.BtnB.wasClicked()) {
+    confirmList();
+  }
+  if (M5.BtnEXT.wasClicked()) {
+    if (mode == Mode::Root) {
+      showMain();
+    } else {
+      enterList(Mode::Root);
+    }
+  }
 }
 
 /**
@@ -863,6 +1463,7 @@ void setup() {
   ensureRtcFromBuildStamp();
   ensureBaselineCleanDate();
   migrateDiagnostics();
+  loadCleaners();
   loadState();
   // Jeder Kaltstart: EMA sichern (Power-Off verliert RAM).
   updateBatteryEstimate(true);
@@ -916,45 +1517,24 @@ void loop() {
     awakeLimitMs = AWAKE_MS;
   }
 
-  bool enteredSelection = false;
-  if (!selecting && dialClicked()) {
-    selecting = true;
-    picker = 0;
-    enteredSelection = true;
-    enterSelectionScreen();
+  if (mode == Mode::Main) {
+    if (dialClicked()) {
+      enterList(Mode::Root);
+    }
+  } else if (mode == Mode::Edit) {
+    handleEditInput();
+  } else {
+    handleListInput();
   }
 
-  if (selecting && !enteredSelection) {
-    // Dial Up = vorherige Zeile, Dial Down = nächste, Mid = OK
-    if (M5.BtnA.wasClicked()) {
-      uint8_t previousPicker = picker;
-      picker = (picker + SELECTION_ITEM_COUNT - 1) % SELECTION_ITEM_COUNT;
-      updateSelectionPicker(previousPicker);
-    }
-    if (M5.BtnC.wasClicked()) {
-      uint8_t previousPicker = picker;
-      picker = (picker + 1) % SELECTION_ITEM_COUNT;
-      updateSelectionPicker(previousPicker);
-    }
-    if (M5.BtnB.wasClicked()) {
-      selecting = false;
-      awakeStart = millis();
-      if (picker == SELECTION_BACK_INDEX) {
-        refreshMainScreen(epd_mode_t::epd_fastest);
-      } else {
-        saveCleaning(picker);
-        refreshMainScreen(epd_mode_t::epd_fastest);
-      }
-    }
-  }
-
-  if (!selecting && screenDirty) {
+  if (mode == Mode::Main && screenDirty) {
     refreshMainScreen(epd_mode_t::epd_fastest);
   }
 
   if ((millis() - awakeStart) >= awakeLimitMs) {
-    if (selecting) {
-      selecting = false;
+    if (mode != Mode::Main) {
+      mode = Mode::Main;
+      editSpin = false;
       screenDirty = true;
       refreshMainScreen(epd_mode_t::epd_fastest);
     }
@@ -964,5 +1544,5 @@ void loop() {
     awakeLimitMs = AWAKE_MS;
   }
 
-  delay(selecting ? 1 : 20);
+  delay(mode == Mode::Main ? 20 : 1);
 }
